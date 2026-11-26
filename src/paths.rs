@@ -7,6 +7,7 @@ pub struct EnginePaths {
     pub game_dir: PathBuf,
     pub minetest_dir: PathBuf,
     pub textures_dir: PathBuf,
+    pub skins_dir: PathBuf,
     pub worlds_dir: PathBuf,
     pub conf_file: PathBuf,
     pub lua_override_dir: PathBuf,
@@ -50,6 +51,30 @@ impl EnginePaths {
             .unwrap_or_else(|| minetest_dir.join("worlds"));
 
         let textures_dir = minetest_dir.join("textures");
+        let skins_dir = std::env::var_os("CUBEX_SKINS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let local = project_root.join("assets").join("skins");
+                if local.is_dir() {
+                    return local;
+                }
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe.parent() {
+                        let near_exe = exe_dir.join("assets").join("skins");
+                        if near_exe.is_dir() {
+                            return near_exe;
+                        }
+                    }
+                }
+                let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets")
+                    .join("skins");
+                if manifest.is_dir() {
+                    manifest
+                } else {
+                    local
+                }
+            });
         let conf_file = minetest_dir.join("minetest.conf");
         let lua_override_dir = fallback_project.join("lua_overrides").join("cubex_bridge");
         let playit_bin = fallback_project.join("tunnel").join("playit");
@@ -63,6 +88,7 @@ impl EnginePaths {
             game_dir,
             minetest_dir,
             textures_dir,
+            skins_dir,
             worlds_dir,
             conf_file,
             lua_override_dir,
@@ -76,6 +102,7 @@ impl EnginePaths {
     pub fn ensure_dirs(&self) {
         let _ = std::fs::create_dir_all(&self.worlds_dir);
         let _ = std::fs::create_dir_all(&self.textures_dir);
+        let _ = std::fs::create_dir_all(&self.skins_dir);
         let _ = std::fs::create_dir_all(&self.cubex_data_dir);
         let _ = std::fs::create_dir_all(&self.playit_config_dir);
     }

@@ -96,6 +96,15 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     var col = mix(horizon, zenith, up_t);
     col = mix(col, ground, down_t);
 
+    if (sky.params.w < -0.5) {
+        let shimmer = exp(-abs(dir.y) * 5.0) * (0.12 + 0.04 * sin(time * 1.8 + dir.x * 4.0));
+        col = col + sky.sun_color.rgb * shimmer * 0.25;
+        if (sky.params.x > 0.5 && sky.params.y < 0.5) {
+            col = aces_filmic(col);
+        }
+        return vec4<f32>(col, 1.0);
+    }
+
     // Subtle twilight horizon warmth towards the sun azimuth
     let dir_xz = vec2<f32>(dir.x, dir.z);
     let sun_xz = vec2<f32>(sun_dir.x, sun_dir.z);

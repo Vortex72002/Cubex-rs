@@ -12,6 +12,7 @@ use crate::world::light::propagate_chunk_light;
 use crate::world::schematic::{
     rotate_param2_along_y, PlaceFlags, Schematic, SchematicRotation,
 };
+use crate::world::structures::{stamp_overworld_structures_into_chunk, StructurePalette};
 use crate::world::{Chunk, WorldGenType, CHUNK_SIZE};
 
 const TREE_CELL: i32 = 9;
@@ -42,6 +43,7 @@ pub struct MapgenPalette {
     pub sandstone: u16,
     pub gravel: u16,
     pub water: u16,
+    pub lava: u16,
     pub oak_log: u16,
     pub oak_leaves: u16,
     pub birch_log: u16,
@@ -61,6 +63,7 @@ pub struct MapgenPalette {
     pub snow: u16,
     pub snow_layer: u16,
     pub chest: u16,
+    pub structures: StructurePalette,
     pub oak_trees: Vec<Schematic>,
     pub swamp_oak_trees: Vec<Schematic>,
     pub birch_trees: Vec<Schematic>,
@@ -240,6 +243,7 @@ impl MapgenPalette {
             sandstone: resolve_first(&["mcl_core:sandstone", "mcl_core:sand"]),
             gravel: resolve_first(&["mcl_core:gravel", "mcl_core:stone"]),
             water,
+            lava: reg.get_content_id("mcl_core:lava_source"),
             oak_log,
             oak_leaves,
             birch_log,
@@ -275,6 +279,7 @@ impl MapgenPalette {
             snow,
             snow_layer: reg.get_content_id("mcl_core:snow"),
             chest: reg.get_content_id("mcl_chests:chest"),
+            structures: StructurePalette::from_registries(reg),
             oak_trees,
             swamp_oak_trees,
             birch_trees,
@@ -596,6 +601,115 @@ fn stamp_fallback_tree(
     }
 }
 
+const LAVA_POOL_CELL: i32 = 44;
+const LAVA_POOL_SEARCH: i32 = 5;
+
+fn stamp_surface_lava_pools_into_chunk(
+    chunk: &mut Chunk,
+    seed: u64,
+    world_type: WorldGenType,
+    palette: &MapgenPalette,
+) {
+    if palette.lava == CONTENT_UNKNOWN || palette.lava == CONTENT_AIR {
+        return;
+    }
+    let base_x = chunk.pos.x * 16;
+    let base_y = chunk.pos.y * 16;
+    let base_z = chunk.pos.z * 16;
+    if base_y + 15 < SEA_LEVEL || base_y > 84 {
+        return;
+    }
+
+    let min_cx = (base_x - LAVA_POOL_SEARCH).div_euclid(LAVA_POOL_CELL);
+    let max_cx = (base_x + 15 + LAVA_POOL_SEARCH).div_euclid(LAVA_POOL_CELL);
+    let min_cz = (base_z - LAVA_POOL_SEARCH).div_euclid(LAVA_POOL_CELL);
+    let max_cz = (base_z + 15 + LAVA_POOL_SEARCH).div_euclid(LAVA_POOL_CELL);
+
+    for cell_z in min_cz..=max_cz {
+        for cell_x in min_cx..=max_cx {
+            let phash = hash3d(cell_x, 0, cell_z, seed ^ 0x1A7A_9001);
+            if ((phash >> 10) % 100) >= 65 {
+                continue;
+            }
+            let cx_pool = cell_x * LAVA_POOL_CELL + 8 + ((phash % 29) as i32);
+            let cz_pool = cell_z * LAVA_POOL_CELL + 8 + (((phash >> 5) % 29) as i32);
+            if cx_pool * cx_pool + cz_pool * cz_pool < 14 * 14 {
+                continue;
+            }
+
+            let center_y = terrain_height_for(cx_pool, cz_pool, seed, world_type);
+            if center_y < SEA_LEVEL + 2 || center_y > 78 {
+                continue;
+            }
+
+            let mut h_min = center_y;
+            let mut h_max = center_y;
+            for (ox, oz) in [(3, 0), (-3, 0), (0, 3), (0, -3)] {
+                let h = terrain_height_for(cx_pool + ox, cz_pool + oz, seed, world_type);
+                h_min = h_min.min(h);
+                h_max = h_max.max(h);
+            }
+            if h_max - h_min > 4 {
+                continue;
+            }
+
+            if center_y + 4 < base_y || center_y - 2 > base_y + 15 {
+                continue;
+            }
+
+            for dz in -4..=4 {
+                let wz = cz_pool + dz;
+                let lz = wz - base_z;
+                if !(0..16).contains(&lz) {
+                    continue;
+                }
+                for dx in -4..=4 {
+                    let wx = cx_pool + dx;
+                    let lx = wx - base_x;
+                    if !(0..16).contains(&lx) {
+                        continue;
+                    }
+                    let nx = dx as f32 / 2.6;
+                    let nz = dz as f32 / 2.2;
+                    let r2 = nx * nx + nz * nz;
+                    if r2 > 2.1 {
+                        continue;
+                    }
+                    for dy in -2..=4 {
+                        let wy = center_y + dy;
+                        let ly = wy - base_y;
+                        if !(0..16).contains(&ly) {
+                            continue;
+                        }
+                        let idx = crate::world::local_index(lx as usize, ly as usize, lz as usize);
+                        if r2 <= 1.0 {
+                            if dy == -2 {
+                                chunk.nodes[idx] = palette.stone;
+                                chunk.param2[idx] = 0;
+                            } else if dy == -1 {
+                                chunk.nodes[idx] = palette.lava;
+                                chunk.param2[idx] = 0;
+                            } else {
+                                chunk.nodes[idx] = CONTENT_AIR;
+                                chunk.param2[idx] = 0;
+                            }
+                        } else if dy == -2 && chunk.nodes[idx] == CONTENT_AIR {
+                            chunk.nodes[idx] = palette.stone;
+                            chunk.param2[idx] = 0;
+                        } else if dy == -1 {
+                            chunk.nodes[idx] = palette.stone;
+                            chunk.param2[idx] = 0;
+                        } else if dy >= 0 && chunk.nodes[idx] != CONTENT_AIR {
+                            chunk.nodes[idx] = CONTENT_AIR;
+                            chunk.param2[idx] = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Generate a 16x16x16 terrain chunk using Mineclonia node IDs (Default world type).
 pub fn generate_chunk(
     cpos: IVec3,
@@ -803,6 +917,18 @@ pub fn generate_chunk_for_world(
                         palette.iron_ore
                     } else if r < 45 {
                         palette.coal_ore
+                    } else if wy >= 28
+                        && wy < surface_y - 4
+                        && palette.gravel != CONTENT_UNKNOWN
+                        && hash3d(
+                            wx.div_euclid(3),
+                            wy.div_euclid(2),
+                            wz.div_euclid(3),
+                            seed ^ 0x6AA5_4321,
+                        ) % 70
+                            == 0
+                    {
+                        palette.gravel
                     } else if wy < 26 {
                         palette.deepslate
                     } else {
@@ -966,6 +1092,9 @@ pub fn generate_chunk_for_world(
             }
         }
     }
+
+    stamp_surface_lava_pools_into_chunk(&mut chunk, seed, world_type, palette);
+    stamp_overworld_structures_into_chunk(&mut chunk, seed, world_type, &palette.structures);
 
     let top_has_air = (0..CHUNK_SIZE)
         .any(|z| (0..CHUNK_SIZE).any(|x| chunk.nodes[crate::world::local_index(x, 15, z)] == CONTENT_AIR));

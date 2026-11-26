@@ -142,6 +142,11 @@ pub enum ParticleKind {
     Chip,
     ShatterCube,
     TorchEmber,
+    NetherAsh,
+    NetherEmber,
+    PortalSpark,
+    Steam,
+    Explosion,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +375,178 @@ impl ParticleSystem {
         });
     }
 
+    pub fn spawn_nether_ash(&mut self, world_pos: Vec3) {
+        if self.particles.len() >= 640 {
+            self.particles.remove(0);
+        }
+        let mut rng = rand::thread_rng();
+        let shade = rng.gen_range(95..145);
+        self.particles.push(Particle {
+            kind: ParticleKind::NetherAsh,
+            pos: world_pos,
+            vel: Vec3::new(
+                rng.gen_range(-0.35..0.35),
+                rng.gen_range(-0.42..-0.14),
+                rng.gen_range(-0.35..0.35),
+            ),
+            rot: Vec3::new(
+                rng.gen_range(0.0..std::f32::consts::TAU),
+                rng.gen_range(0.0..std::f32::consts::TAU),
+                0.0,
+            ),
+            ang_vel: Vec3::new(0.8, 1.2, 0.7),
+            size: rng.gen_range(0.045..0.075),
+            age: 0.0,
+            max_age: rng.gen_range(2.6..4.8),
+            layer: 0,
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            tint: [shade, (shade / 2).max(28), (shade / 2).max(24), 210],
+            sky: 0,
+            block: 11,
+            bounces: 0,
+        });
+    }
+
+    pub fn spawn_nether_ember(&mut self, world_pos: Vec3) {
+        if self.particles.len() >= 640 {
+            self.particles.remove(0);
+        }
+        let mut rng = rand::thread_rng();
+        self.particles.push(Particle {
+            kind: ParticleKind::NetherEmber,
+            pos: world_pos,
+            vel: Vec3::new(
+                rng.gen_range(-0.32..0.32),
+                rng.gen_range(0.55..1.30),
+                rng.gen_range(-0.32..0.32),
+            ),
+            rot: Vec3::ZERO,
+            ang_vel: Vec3::new(2.2, 3.1, 1.9),
+            size: rng.gen_range(0.04..0.072),
+            age: 0.0,
+            max_age: rng.gen_range(0.8..1.6),
+            layer: 0,
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            tint: [255, rng.gen_range(90..185), 35, 255],
+            sky: 0,
+            block: 15,
+            bounces: 0,
+        });
+    }
+
+    pub fn spawn_portal_spark(&mut self, world_pos: Vec3) {
+        if self.particles.len() >= 640 {
+            self.particles.remove(0);
+        }
+        let mut rng = rand::thread_rng();
+        self.particles.push(Particle {
+            kind: ParticleKind::PortalSpark,
+            pos: world_pos,
+            vel: Vec3::new(
+                rng.gen_range(-0.55..0.55),
+                rng.gen_range(-0.35..0.55),
+                rng.gen_range(-0.55..0.55),
+            ),
+            rot: Vec3::ZERO,
+            ang_vel: Vec3::new(2.5, 4.0, 2.5),
+            size: rng.gen_range(0.05..0.085),
+            age: 0.0,
+            max_age: rng.gen_range(0.55..1.10),
+            layer: 0,
+            uv_min: [0.0, 0.0],
+            uv_max: [1.0, 1.0],
+            tint: [rng.gen_range(175..240), 65, 255, 240],
+            sky: 12,
+            block: 14,
+            bounces: 0,
+        });
+    }
+
+    pub fn spawn_steam_burst(&mut self, block_pos: IVec3, count: usize) {
+        let mut rng = rand::thread_rng();
+        let center = Vec3::new(
+            block_pos.x as f32 + 0.5,
+            block_pos.y as f32 + 0.5,
+            block_pos.z as f32 + 0.5,
+        );
+        for _ in 0..count {
+            if self.particles.len() >= 640 {
+                self.particles.remove(0);
+            }
+            let c = rng.gen_range(210..248);
+            self.particles.push(Particle {
+                kind: ParticleKind::Steam,
+                pos: center
+                    + Vec3::new(
+                        rng.gen_range(-0.35..0.35),
+                        rng.gen_range(-0.15..0.25),
+                        rng.gen_range(-0.35..0.35),
+                    ),
+                vel: Vec3::new(
+                    rng.gen_range(-0.9..0.9),
+                    rng.gen_range(1.2..2.5),
+                    rng.gen_range(-0.9..0.9),
+                ),
+                rot: Vec3::new(rng.gen_range(0.0..3.14), rng.gen_range(0.0..3.14), 0.0),
+                ang_vel: Vec3::new(1.5, 2.0, 1.5),
+                size: rng.gen_range(0.11..0.20),
+                age: 0.0,
+                max_age: rng.gen_range(0.65..1.25),
+                layer: 0,
+                uv_min: [0.0, 0.0],
+                uv_max: [1.0, 1.0],
+                tint: [c, c, c, 210],
+                sky: 4,
+                block: 12,
+                bounces: 0,
+            });
+        }
+    }
+
+    pub fn spawn_explosion_burst(&mut self, center: Vec3, count: usize) {
+        let mut rng = rand::thread_rng();
+        for i in 0..count {
+            if self.particles.len() >= 640 {
+                self.particles.remove(0);
+            }
+            let dir = Vec3::new(
+                rng.gen_range(-1.0..1.0),
+                rng.gen_range(-0.2..1.0),
+                rng.gen_range(-1.0..1.0),
+            )
+            .normalize_or_zero();
+            let speed = rng.gen_range(3.5..9.5);
+            let hot = i % 3 != 0;
+            self.particles.push(Particle {
+                kind: ParticleKind::Explosion,
+                pos: center + dir * rng.gen_range(0.1..0.6),
+                vel: dir * speed,
+                rot: Vec3::new(rng.gen_range(0.0..3.14), rng.gen_range(0.0..3.14), 0.0),
+                ang_vel: Vec3::new(5.0, 6.0, 5.0),
+                size: if hot {
+                    rng.gen_range(0.18..0.34)
+                } else {
+                    rng.gen_range(0.24..0.42)
+                },
+                age: 0.0,
+                max_age: rng.gen_range(0.45..0.95),
+                layer: 0,
+                uv_min: [0.0, 0.0],
+                uv_max: [1.0, 1.0],
+                tint: if hot {
+                    [255, rng.gen_range(115..220), 40, 255]
+                } else {
+                    [72, 68, 66, 235]
+                },
+                sky: 15,
+                block: 15,
+                bounces: 0,
+            });
+        }
+    }
+
     pub fn update(&mut self, dt: f32) {
         self.update_with_world(dt, None, None);
     }
@@ -384,8 +561,26 @@ impl ParticleSystem {
         for p in &mut self.particles {
             p.age += dt;
             match p.kind {
-                ParticleKind::TorchEmber => {
+                ParticleKind::TorchEmber | ParticleKind::NetherEmber => {
                     p.vel.y += 0.35 * dt;
+                    p.vel.x += (p.age * 3.5 + p.pos.z).sin() * 0.25 * dt;
+                    p.rot += p.ang_vel * dt;
+                    p.pos += p.vel * dt;
+                }
+                ParticleKind::NetherAsh => {
+                    p.vel.x += (p.age * 1.4 + p.pos.y * 0.4).cos() * 0.16 * dt;
+                    p.vel.z += (p.age * 1.2 + p.pos.x * 0.4).sin() * 0.16 * dt;
+                    p.rot += p.ang_vel * dt;
+                    p.pos += p.vel * dt;
+                }
+                ParticleKind::PortalSpark | ParticleKind::Steam => {
+                    p.vel *= 1.0 - (1.4 * dt).min(0.4);
+                    p.rot += p.ang_vel * dt;
+                    p.pos += p.vel * dt;
+                }
+                ParticleKind::Explosion => {
+                    p.vel.y += 1.6 * dt;
+                    p.vel *= 1.0 - (2.4 * dt).min(0.6);
                     p.rot += p.ang_vel * dt;
                     p.pos += p.vel * dt;
                 }
@@ -488,7 +683,13 @@ impl ParticleSystem {
                 };
                 let hs = p.size * 0.5 * shrink;
                 let rot_m = glam::Mat3::from_euler(glam::EulerRot::YXZ, p.rot.y, p.rot.x, p.rot.z);
-                let extra = if p.kind == ParticleKind::TorchEmber {
+                let extra = if matches!(
+                    p.kind,
+                    ParticleKind::TorchEmber
+                        | ParticleKind::NetherEmber
+                        | ParticleKind::PortalSpark
+                        | ParticleKind::Explosion
+                ) {
                     VoxelVertex::FLAG_EMISSIVE | (1u32 << 27)
                 } else {
                     1u32 << 27

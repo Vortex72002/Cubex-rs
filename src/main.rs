@@ -1,4 +1,14 @@
 use cubex_rs::audio::{AudioEngine, SoundCategory};
+use cubex_rs::autotest::{
+    parse_autotest_args, AutoTestConfig, AutoTestReport, SurvivalNetherBot, SURVIVAL_NETHER_SEED,
+};
+use cubex_rs::qa::bot::{run_headless_playthrough, PlaythroughReport, QaPlaythroughBot};
+use cubex_rs::qa::fuzzer::run_physics_fuzzer;
+use cubex_rs::qa::static_audit::run_static_audit;
+use cubex_rs::qa::visual::run_visual_regression;
+use cubex_rs::qa::{
+    parse_qa_args, unix_timestamp_now, write_master_report, QaCliCommand, QaMasterReport,
+};
 use cubex_rs::config::{
     AudioSettings, CoopMode, EngineSettings, GraphicsQuality, MinetestConfig, PlayerInputDevice,
 };
@@ -15,13 +25,15 @@ use cubex_rs::network::protocol::{
 };
 use cubex_rs::network::tunnel::PlayitTunnelManager;
 use cubex_rs::paths::EnginePaths;
+use cubex_rs::physics::raycast::held_item_is_empty_bucket;
 use cubex_rs::physics::{
-    add_drops_to_inventory, raycast_entities, raycast_player, raycast_voxel_ex,
+    add_drops_to_inventory, log_player_damage, raycast_entities, raycast_player, raycast_voxel_ex,
     selected_world_boxes, targeted_node_has_interaction, try_eat_held_food,
-    try_interact_or_place, DigController, GameMode, MoveInput, PlayerController, RaycastHit,
+    try_interact_or_place, DamageSource, DigController, GameMode, MoveInput, PlayerController,
+    RaycastHit,
 };
 use cubex_rs::registry::{
-    DrawType, EngineRegistries, CONTENT_AIR, CONTENT_IGNORE, CONTENT_UNKNOWN,
+    DrawType, EngineRegistries, CONTENT_AIR, CONTENT_IGNORE, CONTENT_UNKNOWN, RAM_MIC_ITEM_ID,
 };
 use cubex_rs::render::camera::{compute_camera_rig, CameraMode};
 use cubex_rs::render::mesher::{
@@ -31,12 +43,18 @@ use cubex_rs::render::{
     EntityRenderSnapshot, RemotePlayerRenderSnapshot, SecondaryRenderTarget, ViewportCamera,
     WgpuRenderer,
 };
-use cubex_rs::textures::{list_resource_packs, PreloadedTextures, ResourcePackInfo, TextureAtlas};
+use cubex_rs::textures::{
+    is_carterpcs_skin, list_available_skins, list_resource_packs, resolve_skin_rgba,
+    PreloadedTextures, ResourcePackInfo, SkinInfo, TextureAtlas,
+};
+use cubex_rs::ui::creative_inventory::{
+    render_creative_inventory, CreativeInventoryState, CREATIVE_INVENTORY_FORMNAME,
+};
 use cubex_rs::ui::death_screen::{render_death_screen, DeathScreenAction};
 use cubex_rs::ui::formspec::{
-    ensure_craft_grid_size, formspec_requires_3x3_craft, parse_formspec, refresh_craft_preview,
-    render_formspec_interactive, resolve_inv_node_pos, shift_transfer_slot, ControllerFormInput,
-    FormspecContext, InventoryCursor, ParsedFormspec,
+    build_loot_chest_formspec, ensure_craft_grid_size, formspec_requires_3x3_craft, parse_formspec,
+    refresh_craft_preview, render_formspec_interactive, resolve_inv_node_pos, shift_transfer_slot,
+    ControllerFormInput, FormspecContext, InventoryCursor, ParsedFormspec,
 };
 use cubex_rs::ui::hud::{render_hud_full, render_hud_in_rect, HudTelemetry};
 use cubex_rs::ui::loading_screen::{render_loading_screen, LoadingScreenInfo};
@@ -50,11 +68,28 @@ use cubex_rs::world::mapgen::{
     biome_name_at, chunk_y_range_for, find_spawn_pos, generate_chunk_for_world,
     terrain_height_for, MapgenPalette, SEA_LEVEL,
 };
+use cubex_rs::world::mobs::{
+    MeleeNativeResult, MobManager, MobParticleKind, MobPlayerInput,
+};
+use cubex_rs::world::nether::{
+    ensure_nether_columns, generate_nether_chunk, nether_biome_name_at, NetherPalette,
+    NETHER_CHUNK_Y_RANGE,
+};
 use cubex_rs::world::persistence::{
-    load_player_by_name, load_world, save_world, save_world_players,
+    load_dimension_chunks, load_player_by_name, load_world, save_dimension_chunks, save_world,
+    save_world_players,
+};
+use cubex_rs::world::portal::{
+    extinguish_portal_around, find_or_build_destination_portal, is_nether_portal_node, PortalAxis,
 };
 use cubex_rs::world::schematic::{PlaceFlags, Schematic, SchematicRotation};
-use cubex_rs::world::{Chunk, WorldGenType, WorldInfo, WorldStore};
+use cubex_rs::world::structures::{
+    locate_nearest_structure, populate_structure_chests_for_chunk, StructureKind,
+};
+use cubex_rs::world::{
+    scale_portal_coords, Chunk, Difficulty, DimensionId, Gamerules, WorldGenType, WorldInfo,
+    WorldStore,
+};
 
 use glam::{IVec3, Vec3};
 use mlua::ObjectLike;
@@ -271,11 +306,13 @@ fn build_panorama_bundle(
 
 struct GeneratedColumnBatch {
     epoch: u64,
+    dimension: DimensionId,
     columns: Vec<(i32, i32)>,
 }
 
 struct MeshedChunkPacket {
     epoch: u64,
+    dimension: DimensionId,
     mesh: ChunkMeshData,
 }
 
@@ -326,6 +363,7 @@ struct LocalPlayerSlot {
     last_inv_total_count: u32,
     active_formspec: Option<ActiveFormspec>,
     formspec_fields: HashMap<String, String>,
+    creative_state: CreativeInventoryState,
     inv_cursor: InventoryCursor,
     form_slot_idx: usize,
     place_repeat_cd: f32,
@@ -355,6 +393,7 @@ impl LocalPlayerSlot {
             last_inv_total_count: 0,
             active_formspec: None,
             formspec_fields: HashMap::new(),
+            creative_state: CreativeInventoryState::default(),
             inv_cursor: InventoryCursor::default(),
             form_slot_idx: 0,
             place_repeat_cd: 0.0,
@@ -472,10 +511,15 @@ struct CubexEngine {
     audio_settings_shared: Arc<RwLock<AudioSettings>>,
     registries: Arc<RwLock<EngineRegistries>>,
     world: Arc<WorldStore>,
+    nether_world: Arc<WorldStore>,
     lua_rt: Option<LuaRuntime>,
     palette: MapgenPalette,
+    nether_palette: NetherPalette,
     atlas: Arc<TextureAtlas>,
     packs: Vec<ResourcePackInfo>,
+    available_skins: Vec<SkinInfo>,
+    last_p1_skin: String,
+    last_p2_skin: String,
     tunnel: PlayitTunnelManager,
     tokio_rt: tokio::runtime::Runtime,
     net_session: Option<NetClientSession>,
@@ -509,14 +553,21 @@ struct CubexEngine {
     world_epoch_shared: Arc<AtomicU64>,
     generated_columns: HashSet<(i32, i32)>,
     gen_in_flight: HashSet<(i32, i32)>,
+    nether_generated_columns: HashSet<(i32, i32)>,
+    nether_gen_in_flight: HashSet<(i32, i32)>,
     gen_tx: Sender<GeneratedColumnBatch>,
     gen_rx: Receiver<GeneratedColumnBatch>,
     meshing_in_flight: HashSet<IVec3>,
     pending_meshes: VecDeque<ChunkMeshData>,
+    nether_meshing_in_flight: HashSet<IVec3>,
+    nether_pending_meshes: VecDeque<ChunkMeshData>,
     mesh_tx: Sender<MeshedChunkPacket>,
     mesh_rx: Receiver<MeshedChunkPacket>,
     loaded_atlas_pack: Option<Option<PathBuf>>,
     last_prune_chunks: Option<Vec<(i32, i32)>>,
+    last_nether_prune_chunks: Option<Vec<(i32, i32)>>,
+    nether_ambient_timer: f32,
+    mob_manager: MobManager,
     pending_load: Option<WorldLoadPhase>,
     panorama_center: Vec3,
     panorama_fog_dist: f32,
@@ -546,11 +597,24 @@ impl CubexEngine {
         let registries = Arc::new(RwLock::new(EngineRegistries::new()));
         let default_world = std::env::temp_dir().join("cubex_rs_panorama");
         let world = Arc::new(WorldStore::new(&default_world, 1337));
+        let nether_world = Arc::new(WorldStore::new_for_dimension(
+            &default_world,
+            1337,
+            DimensionId::Nether,
+            WorldGenType::Default,
+            settings.difficulty,
+            settings.gamerules.clone(),
+            "Survival",
+        ));
 
         let palette = MapgenPalette::default();
+        let nether_palette = NetherPalette::from_registries(&registries.read());
         let audio = Arc::new(AudioEngine::empty_silent());
         let audio_slot = Arc::new(RwLock::new(audio.clone()));
         let atlas = Arc::new(TextureAtlas::placeholder());
+        let available_skins = list_available_skins(&paths.skins_dir, &atlas.get_player_skin_rgba());
+        let last_p1_skin = settings.player_skin.clone();
+        let last_p2_skin = settings.p2_skin.clone();
 
         let player_state = Arc::new(RwLock::new(ObjectState::new_player(&settings.player_name)));
         let last_inv_total_count = total_inventory_items(&player_state);
@@ -563,7 +627,10 @@ impl CubexEngine {
 
         let tokio_rt = tokio::runtime::Runtime::new()?;
         let servers_file = paths.cubex_data_dir.join("servers.json");
-        let title_state = TitleScreenState::new(&paths.worlds_dir, &servers_file);
+        let mut title_state = TitleScreenState::new(&paths.worlds_dir, &servers_file);
+        title_state.available_skins = available_skins.clone();
+        let mut pause_state = PauseMenuState::default();
+        pause_state.available_skins = available_skins.clone();
         let peers = [
             LocalPlayerSlot::new(&settings.p2_name),
             LocalPlayerSlot::new(&settings.p3_name),
@@ -592,10 +659,15 @@ impl CubexEngine {
             audio_settings_shared,
             registries,
             world,
+            nether_world,
             lua_rt: None,
             palette,
+            nether_palette,
             atlas,
             packs,
+            available_skins,
+            last_p1_skin,
+            last_p2_skin,
             tunnel,
             tokio_rt,
             net_session: None,
@@ -618,7 +690,7 @@ impl CubexEngine {
             last_interact_pos: None,
             last_inv_total_count,
             title_state,
-            pause_state: PauseMenuState::default(),
+            pause_state,
             active_formspec: None,
             formspec_fields: HashMap::new(),
             chat_messages: vec![
@@ -629,14 +701,21 @@ impl CubexEngine {
             world_epoch_shared,
             generated_columns: HashSet::new(),
             gen_in_flight: HashSet::new(),
+            nether_generated_columns: HashSet::new(),
+            nether_gen_in_flight: HashSet::new(),
             gen_tx,
             gen_rx,
             meshing_in_flight: HashSet::new(),
             pending_meshes: VecDeque::new(),
+            nether_meshing_in_flight: HashSet::new(),
+            nether_pending_meshes: VecDeque::new(),
             mesh_tx,
             mesh_rx,
             loaded_atlas_pack: None,
             last_prune_chunks: None,
+            last_nether_prune_chunks: None,
+            nether_ambient_timer: 0.0,
+            mob_manager: MobManager::new(1337),
             pending_load: None,
             panorama_center,
             panorama_fog_dist: 92.0,
@@ -652,6 +731,63 @@ impl CubexEngine {
         *self.audio_slot.write() = loaded;
     }
 
+    fn refresh_available_skins(&mut self) {
+        let def_skin = self.atlas.get_player_skin_rgba();
+        let skins = list_available_skins(&self.paths.skins_dir, &def_skin);
+        self.available_skins = skins.clone();
+        self.title_state.available_skins = skins.clone();
+        self.pause_state.available_skins = skins;
+        self.title_state.skin_preview_handles.clear();
+        self.pause_state.skin_preview_handles.clear();
+    }
+
+    fn sync_skins_and_props(
+        &mut self,
+        renderer: Option<&mut WgpuRenderer>,
+        egui_ctx: Option<&egui::Context>,
+        force_equip: bool,
+    ) {
+        if self.available_skins.is_empty() {
+            self.refresh_available_skins();
+        }
+        let fallback = self.atlas.get_player_skin_rgba();
+        let p1_skin = self.settings.player_skin.clone();
+        let p2_skin = self.settings.p2_skin.clone();
+        let p1_rgba = resolve_skin_rgba(&self.available_skins, &p1_skin, &fallback);
+        let p2_rgba = resolve_skin_rgba(&self.available_skins, &p2_skin, &fallback);
+
+        if let Some(ctx) = egui_ctx {
+            self.title_state.icons.set_player_skin_rgba(
+                ctx,
+                p1_rgba.as_raw(),
+                p1_rgba.width(),
+                p1_rgba.height(),
+            );
+        }
+        if let Some(r) = renderer {
+            r.set_player_skin(0, &p1_skin, &p1_rgba);
+            r.set_player_skin(1, &p2_skin, &p2_rgba);
+        }
+
+        let p1_changed = self.last_p1_skin != p1_skin;
+        let p2_changed = self.last_p2_skin != p2_skin;
+        self.last_p1_skin = p1_skin.clone();
+        self.last_p2_skin = p2_skin.clone();
+
+        if is_carterpcs_skin(&p1_skin) && (force_equip || p1_changed) {
+            equip_ram_mic_for_carterpcs(&self.player_state, &mut self.player.selected_slot);
+            self.last_inv_total_count = total_inventory_items(&self.player_state);
+        }
+        if is_carterpcs_skin(&p2_skin) && (force_equip || p2_changed) && self.peers[0].joined {
+            equip_ram_mic_for_carterpcs(
+                &self.peers[0].player_state,
+                &mut self.peers[0].player.selected_slot,
+            );
+            self.peers[0].last_inv_total_count =
+                total_inventory_items(&self.peers[0].player_state);
+        }
+    }
+
     fn boot_base(paths: EnginePaths) -> anyhow::Result<Self> {
         let mut engine = Self::boot_shell(paths)?;
         let lua_rt = LuaRuntime::boot(
@@ -661,6 +797,7 @@ impl CubexEngine {
             engine.config.clone(),
         )?;
         engine.palette = MapgenPalette::from_registries(&engine.registries.read());
+        engine.nether_palette = NetherPalette::from_registries(&engine.registries.read());
         let loaded_audio = Arc::new(AudioEngine::new(
             &lua_rt.shared.mod_paths.read(),
             &engine.paths.game_dir,
@@ -675,6 +812,7 @@ impl CubexEngine {
             &engine.registries.read(),
         ));
         engine.loaded_atlas_pack = Some(rp_path);
+        engine.refresh_available_skins();
 
         let _ = lua_rt.join_player(engine.player_state.clone());
         engine.last_inv_total_count = total_inventory_items(&engine.player_state);
@@ -740,6 +878,9 @@ impl CubexEngine {
                 self.world.insert_chunk(ch);
             }
             if !inserted_coords.is_empty() {
+                for &cpos in &inserted_coords {
+                    populate_structure_chests_for_chunk(&self.world, cpos, seed, wt, &reg);
+                }
                 propagate_world_light(&self.world, &inserted_coords, &reg);
             }
         }
@@ -753,40 +894,68 @@ impl CubexEngine {
     }
 
     fn stream_chunks_around_player(&mut self) {
-        let mut centers = vec![(
-            (self.player.pos.x / 16.0).floor() as i32,
-            (self.player.pos.z / 16.0).floor() as i32,
-        )];
+        let mut ow_centers: Vec<(i32, i32)> = Vec::new();
+        let mut nw_centers: Vec<(i32, i32)> = Vec::new();
+        let push_unique = |list: &mut Vec<(i32, i32)>, pos: Vec3| {
+            let pc = (
+                (pos.x / 16.0).floor() as i32,
+                (pos.z / 16.0).floor() as i32,
+            );
+            if !list.contains(&pc) {
+                list.push(pc);
+            }
+        };
+        if self.player.dimension.is_nether() {
+            push_unique(&mut nw_centers, self.player.pos);
+        } else {
+            push_unique(&mut ow_centers, self.player.pos);
+        }
         if self.mode == AppMode::Playing && self.settings.coop_mode.is_active() {
             for peer in &self.peers {
                 if peer.joined {
-                    let pc = (
-                        (peer.player.pos.x / 16.0).floor() as i32,
-                        (peer.player.pos.z / 16.0).floor() as i32,
-                    );
-                    if !centers.contains(&pc) {
-                        centers.push(pc);
+                    if peer.player.dimension.is_nether() {
+                        push_unique(&mut nw_centers, peer.player.pos);
+                    } else {
+                        push_unique(&mut ow_centers, peer.player.pos);
                     }
                 }
             }
         }
-        self.stream_chunks_around_centers(&centers);
+        if self.mode == AppMode::Playing {
+            for sp in self.stream_players.values() {
+                if sp.player.dimension.is_nether() {
+                    push_unique(&mut nw_centers, sp.player.pos);
+                } else {
+                    push_unique(&mut ow_centers, sp.player.pos);
+                }
+            }
+        }
+        self.stream_chunks_for_dimensions(&ow_centers, &nw_centers);
     }
 
-    fn stream_chunks_around_centers(&mut self, centers: &[(i32, i32)]) {
+    fn stream_chunks_for_dimensions(
+        &mut self,
+        ow_centers: &[(i32, i32)],
+        nw_centers: &[(i32, i32)],
+    ) {
         while let Ok(batch) = self.gen_rx.try_recv() {
             if batch.epoch == self.world_epoch {
+                let target = if batch.dimension.is_nether() {
+                    &mut self.nether_gen_in_flight
+                } else {
+                    &mut self.gen_in_flight
+                };
                 for col in batch.columns {
-                    self.gen_in_flight.remove(&col);
+                    target.remove(&col);
                 }
             }
         }
 
         let r = (self.settings.render_distance_chunks as i32).clamp(2, 32);
 
-        if self.gen_in_flight.len() < 12 {
+        if !ow_centers.is_empty() && self.gen_in_flight.len() < 12 {
             let mut candidates: HashMap<(i32, i32), i32> = HashMap::new();
-            for &(pcx, pcz) in centers {
+            for &(pcx, pcz) in ow_centers {
                 for dz in -r..=r {
                     for dx in -r..=r {
                         let d2 = dx * dx + dz * dz;
@@ -854,10 +1023,20 @@ impl CubexEngine {
                         }
                         if !inserted_coords.is_empty() {
                             let reg = reg_arc.read();
+                            for &cpos in &inserted_coords {
+                                populate_structure_chests_for_chunk(
+                                    &world_arc,
+                                    cpos,
+                                    seed,
+                                    wt,
+                                    &reg,
+                                );
+                            }
                             propagate_world_light(&world_arc, &inserted_coords, &reg);
                         }
                         let _ = gen_tx.send(GeneratedColumnBatch {
                             epoch,
+                            dimension: DimensionId::Overworld,
                             columns: dispatch_cols,
                         });
                     });
@@ -865,8 +1044,98 @@ impl CubexEngine {
             }
         }
 
-        // Dispatch background dirty chunks for parallel rayon meshing
-        if self.meshing_in_flight.len() < 48 {
+        if !nw_centers.is_empty() && self.nether_gen_in_flight.len() < 12 {
+            let mut candidates: HashMap<(i32, i32), i32> = HashMap::new();
+            let nr = r.min(12);
+            for &(pcx, pcz) in nw_centers {
+                for dz in -nr..=nr {
+                    for dx in -nr..=nr {
+                        let d2 = dx * dx + dz * dz;
+                        if d2 > nr * nr + 2 {
+                            continue;
+                        }
+                        let col = (pcx + dx, pcz + dz);
+                        if !self.nether_generated_columns.contains(&col) {
+                            candidates
+                                .entry(col)
+                                .and_modify(|prev| *prev = (*prev).min(d2))
+                                .or_insert(d2);
+                        }
+                    }
+                }
+            }
+            if !candidates.is_empty() {
+                let mut sorted: Vec<(i32, (i32, i32))> =
+                    candidates.into_iter().map(|(c, d2)| (d2, c)).collect();
+                sorted.sort_by_key(|(d2, _)| *d2);
+                let budget = (12 - self.nether_gen_in_flight.len()).min(4);
+                let mut dispatch_cols = Vec::with_capacity(budget);
+                for (_, col) in sorted.into_iter().take(budget) {
+                    self.nether_generated_columns.insert(col);
+                    self.nether_gen_in_flight.insert(col);
+                    dispatch_cols.push(col);
+                }
+                if !dispatch_cols.is_empty() {
+                    let seed = self.nether_world.seed;
+                    let pal = self.nether_palette.clone();
+                    let reg_arc = self.registries.clone();
+                    let world_arc = self.nether_world.clone();
+                    let epoch = self.world_epoch;
+                    let epoch_shared = self.world_epoch_shared.clone();
+                    let gen_tx = self.gen_tx.clone();
+                    rayon::spawn(move || {
+                        if epoch_shared.load(Ordering::Acquire) != epoch {
+                            return;
+                        }
+                        let existing: HashSet<IVec3> =
+                            world_arc.chunks.read().keys().copied().collect();
+                        let missing_coords: Vec<IVec3> = dispatch_cols
+                            .iter()
+                            .copied()
+                            .flat_map(|(cx, cz)| {
+                                NETHER_CHUNK_Y_RANGE.map(move |cy| IVec3::new(cx, cy, cz))
+                            })
+                            .filter(|cpos| !existing.contains(cpos))
+                            .collect();
+                        let chunks: Vec<Chunk> = {
+                            let reg = reg_arc.read();
+                            missing_coords
+                                .into_par_iter()
+                                .map(|cpos| generate_nether_chunk(cpos, seed, &pal, &reg))
+                                .collect()
+                        };
+                        if epoch_shared.load(Ordering::Acquire) != epoch {
+                            return;
+                        }
+                        let inserted_coords: Vec<IVec3> = chunks.iter().map(|c| c.pos).collect();
+                        for ch in chunks {
+                            world_arc.insert_chunk(ch);
+                        }
+                        if !inserted_coords.is_empty() {
+                            let reg = reg_arc.read();
+                            for &cpos in &inserted_coords {
+                                populate_structure_chests_for_chunk(
+                                    &world_arc,
+                                    cpos,
+                                    seed,
+                                    WorldGenType::Default,
+                                    &reg,
+                                );
+                            }
+                            propagate_world_light(&world_arc, &inserted_coords, &reg);
+                        }
+                        let _ = gen_tx.send(GeneratedColumnBatch {
+                            epoch,
+                            dimension: DimensionId::Nether,
+                            columns: dispatch_cols,
+                        });
+                    });
+                }
+            }
+        }
+
+        // Dispatch background dirty chunks for parallel rayon meshing (Overworld + Nether)
+        if !ow_centers.is_empty() && self.meshing_in_flight.len() < 48 {
             let max_take = (48 - self.meshing_in_flight.len()).min(16);
             let dirty = self.world.take_dirty_chunks(max_take);
             let mut snaps = Vec::new();
@@ -896,7 +1165,51 @@ impl CubexEngine {
                             return;
                         }
                         let mesh = mesh_chunk_with_atlas(&snap, &reg, &atlas_arc, smooth);
-                        let _ = tx.send(MeshedChunkPacket { epoch, mesh });
+                        let _ = tx.send(MeshedChunkPacket {
+                            epoch,
+                            dimension: DimensionId::Overworld,
+                            mesh,
+                        });
+                    });
+                });
+            }
+        }
+
+        if !nw_centers.is_empty() && self.nether_meshing_in_flight.len() < 48 {
+            let max_take = (48 - self.nether_meshing_in_flight.len()).min(16);
+            let dirty = self.nether_world.take_dirty_chunks(max_take);
+            let mut snaps = Vec::new();
+            for cpos in dirty {
+                if self.nether_meshing_in_flight.insert(cpos) {
+                    if let Some(snap) = self.nether_world.snapshot_chunk(cpos) {
+                        snaps.push(snap);
+                    } else {
+                        self.nether_meshing_in_flight.remove(&cpos);
+                    }
+                }
+            }
+            if !snaps.is_empty() {
+                let reg_arc = self.registries.clone();
+                let atlas_arc = self.atlas.clone();
+                let smooth = self.settings.smooth_lighting;
+                let tx = self.mesh_tx.clone();
+                let epoch = self.world_epoch;
+                let epoch_shared = self.world_epoch_shared.clone();
+                rayon::spawn(move || {
+                    if epoch_shared.load(Ordering::Acquire) != epoch {
+                        return;
+                    }
+                    let reg = reg_arc.read();
+                    snaps.into_par_iter().for_each_with(tx, |tx, snap| {
+                        if epoch_shared.load(Ordering::Acquire) != epoch {
+                            return;
+                        }
+                        let mesh = mesh_chunk_with_atlas(&snap, &reg, &atlas_arc, smooth);
+                        let _ = tx.send(MeshedChunkPacket {
+                            epoch,
+                            dimension: DimensionId::Nether,
+                            mesh,
+                        });
                     });
                 });
             }
@@ -906,8 +1219,13 @@ impl CubexEngine {
             if pkt.epoch != self.world_epoch {
                 continue;
             }
-            self.meshing_in_flight.remove(&pkt.mesh.chunk_pos);
-            self.pending_meshes.push_back(pkt.mesh);
+            if pkt.dimension.is_nether() {
+                self.nether_meshing_in_flight.remove(&pkt.mesh.chunk_pos);
+                self.nether_pending_meshes.push_back(pkt.mesh);
+            } else {
+                self.meshing_in_flight.remove(&pkt.mesh.chunk_pos);
+                self.pending_meshes.push_back(pkt.mesh);
+            }
         }
     }
 
@@ -990,8 +1308,12 @@ impl CubexEngine {
                 &self.registries.read(),
             ));
             self.loaded_atlas_pack = Some(rp);
+            self.refresh_available_skins();
             if let Some(r) = renderer {
                 r.reload_atlas(&self.atlas);
+                self.sync_skins_and_props(Some(r), None, false);
+            } else {
+                self.sync_skins_and_props(None, None, false);
             }
             let keys: Vec<IVec3> = self.world.chunks.read().keys().copied().collect();
             self.world.dirty_queue.write().extend(keys);
@@ -1093,13 +1415,24 @@ impl CubexEngine {
         self.meshing_in_flight.clear();
         self.pending_meshes.clear();
         self.last_prune_chunks = None;
+        self.nether_generated_columns.clear();
+        self.nether_gen_in_flight.clear();
+        self.nether_meshing_in_flight.clear();
+        self.nether_pending_meshes.clear();
+        self.last_nether_prune_chunks = None;
         while self.gen_rx.try_recv().is_ok() {}
         while self.mesh_rx.try_recv().is_ok() {}
 
         renderer.chunk_meshes.clear();
+        renderer.nether_chunk_meshes.clear();
+        renderer.update_entities(&[], &self.registries.read(), &self.atlas);
+        renderer.update_nether_entities(&[], &self.registries.read(), &self.atlas);
+        renderer.update_guardian_lasers(&[]);
         renderer.particles.clear();
+        renderer.nether_particles.clear();
         renderer.remote_players.clear();
         renderer.fog_dist_override = None;
+        self.mob_manager = MobManager::new(info.seed);
         self.remote_players.clear();
         self.stream_players.clear();
         self.digger.reset();
@@ -1123,6 +1456,15 @@ impl CubexEngine {
             info.gamerules.clone(),
             &info.gamemode,
         ));
+        let new_nether_world = Arc::new(WorldStore::new_for_dimension(
+            &info.path,
+            info.seed,
+            DimensionId::Nether,
+            info.world_type,
+            info.difficulty,
+            info.gamerules.clone(),
+            &info.gamemode,
+        ));
         {
             let mut cfg = self.config.write();
             cfg.set(
@@ -1141,6 +1483,7 @@ impl CubexEngine {
         .expect("LuaRuntime boot for entered world");
 
         self.palette = MapgenPalette::from_registries(&new_reg.read());
+        self.nether_palette = NetherPalette::from_registries(&new_reg.read());
         let rp = self.resolve_rp_path();
         let can_reuse_atlas = self.loaded_atlas_pack.as_ref() == Some(&rp) && {
             let old_reg = self.registries.read();
@@ -1167,6 +1510,7 @@ impl CubexEngine {
         }
 
         self.world = new_world;
+        self.nether_world = new_nether_world;
         self.registries = new_reg;
         self.lua_rt = Some(new_rt);
 
@@ -1179,6 +1523,7 @@ impl CubexEngine {
         let had_saved_player = {
             let mut ps_guard = self.player_state.write();
             let reg_guard = self.registries.read();
+            let _ = load_dimension_chunks(&self.nether_world, &reg_guard);
             match load_world(&self.world, &reg_guard, Some(&mut ps_guard)) {
                 Ok(saved) => {
                     self.settings.difficulty = saved.difficulty;
@@ -1197,8 +1542,13 @@ impl CubexEngine {
                         self.player.vel = Vec3::ZERO;
                         self.player.selected_slot = sp.wield_index.saturating_sub(1).min(8);
                         self.player.gamemode = parse_gamemode(&sp.gamemode);
+                        self.player.dimension = sp.dimension;
+                        self.player.portal_charge = 0.0;
+                        self.player.portal_cooldown = 0.0;
+                        self.player.portal_warp_flash = 0.0;
                         ps_guard.hp = self.player.hp;
                         ps_guard.hunger = self.player.hunger;
+                        ps_guard.dimension = sp.dimension;
                         true
                     } else {
                         self.player.gamemode = parse_gamemode(&saved.gamemode);
@@ -1211,6 +1561,10 @@ impl CubexEngine {
                         self.player.eat_cooldown = 0.0;
                         self.player.vel = Vec3::ZERO;
                         self.player.selected_slot = 0;
+                        self.player.dimension = DimensionId::Overworld;
+                        self.player.portal_charge = 0.0;
+                        self.player.portal_cooldown = 0.0;
+                        self.player.portal_warp_flash = 0.0;
                         false
                     }
                 }
@@ -1225,10 +1579,33 @@ impl CubexEngine {
                     self.player.eat_cooldown = 0.0;
                     self.player.vel = Vec3::ZERO;
                     self.player.selected_slot = 0;
+                    self.player.dimension = DimensionId::Overworld;
+                    self.player.portal_charge = 0.0;
+                    self.player.portal_cooldown = 0.0;
+                    self.player.portal_warp_flash = 0.0;
                     false
                 }
             }
         };
+        if self.player.dimension == DimensionId::Nether {
+            let pcx = (self.player.pos.x / 16.0).floor() as i32;
+            let pcz = (self.player.pos.z / 16.0).floor() as i32;
+            let reg_g = self.registries.read();
+            let _ = ensure_nether_columns(
+                &self.nether_world,
+                pcx,
+                pcz,
+                2,
+                self.nether_world.seed,
+                &self.nether_palette,
+                &reg_g,
+            );
+            for cz in (pcz - 2)..=(pcz + 2) {
+                for cx in (pcx - 2)..=(pcx + 2) {
+                    self.nether_generated_columns.insert((cx, cz));
+                }
+            }
+        }
 
         if !had_saved_player && self.player.gamemode == GameMode::Creative {
             self.player_state.write().populate_creative_starter();
@@ -1241,12 +1618,15 @@ impl CubexEngine {
             self.player.pos = Vec3::new(sp.x as f32 + 0.5, sp.y as f32, sp.z as f32 + 0.5);
             self.player.vel = Vec3::ZERO;
         }
+        self.player.wither_timer = 0.0;
+        self.player.wither_tick_accum = 0.0;
+        self.player.reset_fall_state();
         had_saved_player
     }
 
     /// Finalize player spawn safety check after initial chunks exist, sync state, and apply Lua/disk config.
     fn finalize_loaded_player_spawn(&mut self, check_saved_surface: bool) {
-        if check_saved_surface {
+        if check_saved_surface && self.player.dimension == DimensionId::Overworld {
             let wt = *self.world.world_type.read();
             if matches!(wt, WorldGenType::Default | WorldGenType::Amplified) {
                 let px = self.player.pos.x.floor() as i32;
@@ -1282,6 +1662,13 @@ impl CubexEngine {
             ps.hp = self.player.hp;
             ps.hunger = self.player.hunger;
             ps.wield_index = self.player.selected_slot + 1;
+            let mut mg = ps.meta.write();
+            mg.fields.insert("mcl_health".into(), self.player.hp.to_string());
+            mg.fields.insert("mcl_hunger:hunger".into(), self.player.hunger.to_string());
+            mg.fields.insert(
+                "mcl_hunger:saturation".into(),
+                format!("{:.2}", self.player.saturation),
+            );
         }
         self.last_inv_total_count = total_inventory_items(&self.player_state);
 
@@ -1292,12 +1679,17 @@ impl CubexEngine {
         if self.settings.coop_mode.is_active() {
             self.ensure_coop_players_joined();
         }
+        if is_carterpcs_skin(&self.settings.player_skin) {
+            equip_ram_mic_for_carterpcs(&self.player_state, &mut self.player.selected_slot);
+            self.last_inv_total_count = total_inventory_items(&self.player_state);
+        }
     }
 
     fn enter_world(&mut self, info: WorldInfo, renderer: &mut WgpuRenderer) {
         let had_saved_player = self.prepare_world_session(&info, renderer);
         self.generate_spawn_area(3, !had_saved_player);
         self.finalize_loaded_player_spawn(had_saved_player);
+        self.sync_skins_and_props(Some(renderer), None, false);
         self.pending_load = None;
         self.mode = AppMode::Playing;
     }
@@ -1352,8 +1744,24 @@ impl CubexEngine {
                 self.peers[idx].player.vel = Vec3::ZERO;
                 self.peers[idx].player.selected_slot = sp.wield_index.saturating_sub(1).min(8);
                 self.peers[idx].player.gamemode = parse_gamemode(&sp.gamemode);
+                self.peers[idx].player.dimension = sp.dimension;
+                if sp.dimension == DimensionId::Nether {
+                    let pcx = (self.peers[idx].player.pos.x / 16.0).floor() as i32;
+                    let pcz = (self.peers[idx].player.pos.z / 16.0).floor() as i32;
+                    let reg_g = self.registries.read();
+                    let _ = ensure_nether_columns(
+                        &self.nether_world,
+                        pcx,
+                        pcz,
+                        2,
+                        self.nether_world.seed,
+                        &self.nether_palette,
+                        &reg_g,
+                    );
+                }
             } else {
                 self.peers[idx].player.pos = self.player.pos + offsets[idx];
+                self.peers[idx].player.dimension = self.player.dimension;
                 self.peers[idx].player.yaw = self.player.yaw;
                 self.peers[idx].player.pitch = 0.0;
                 self.peers[idx].player.vel = Vec3::ZERO;
@@ -1371,17 +1779,36 @@ impl CubexEngine {
                 }
             }
             self.peers[idx].player.flying = self.peers[idx].player.gamemode == GameMode::Spectator;
+            self.peers[idx].player.reset_fall_state();
             {
                 let mut ps_peer = self.peers[idx].player_state.write();
                 ps_peer.pos = self.peers[idx].player.pos;
+                ps_peer.dimension = self.peers[idx].player.dimension;
                 ps_peer.hp = self.peers[idx].player.hp;
                 ps_peer.hunger = self.peers[idx].player.hunger;
                 ps_peer.wield_index = self.peers[idx].player.selected_slot + 1;
+                let mut mg = ps_peer.meta.write();
+                mg.fields
+                    .insert("mcl_health".into(), self.peers[idx].player.hp.to_string());
+                mg.fields.insert(
+                    "mcl_hunger:hunger".into(),
+                    self.peers[idx].player.hunger.to_string(),
+                );
+                mg.fields.insert(
+                    "mcl_hunger:saturation".into(),
+                    format!("{:.2}", self.peers[idx].player.saturation),
+                );
             }
             if let Some(ref rt) = self.lua_rt {
                 rt.set_gamemode(
                     self.peers[idx].player_state.clone(),
                     self.peers[idx].player.gamemode.as_str(),
+                );
+            }
+            if slot == 1 && is_carterpcs_skin(&self.settings.p2_skin) {
+                equip_ram_mic_for_carterpcs(
+                    &self.peers[idx].player_state,
+                    &mut self.peers[idx].player.selected_slot,
                 );
             }
             self.peers[idx].last_inv_total_count =
@@ -1411,6 +1838,9 @@ impl CubexEngine {
                 }
             } else if let Err(e) = save_world(&self.world, &reg, Some(&ps1)) {
                 tracing::warn!("Failed to save world: {e}");
+            }
+            if let Err(e) = save_dimension_chunks(&self.nether_world, &reg) {
+                tracing::warn!("Failed to save Nether chunks: {e}");
             }
         }
     }
@@ -1443,7 +1873,7 @@ impl CubexEngine {
             match cmd {
                 "help" => {
                     self.chat_messages.push(
-                        "§eCommands: /help, /time <day|night|sunrise|sunset|0..1>, /gamemode <survival|creative|spectator>, /weather <clear|rain|thunder>, /seed, /tp <x> <y> <z>".into(),
+                        "§eCommands: /help, /time <day|night|sunrise|sunset|0..1>, /gamemode <survival|creative|spectator>, /weather <clear|rain|thunder>, /seed, /tp <x> <y> <z> [overworld|nether], /locate <fortress|bastion|monument|temple> [info]".into(),
                     );
                 }
                 "seed" => {
@@ -1494,11 +1924,68 @@ impl CubexEngine {
                         if let (Ok(x), Ok(y), Ok(z)) =
                             (xs.parse::<f32>(), ys.parse::<f32>(), zs.parse::<f32>())
                         {
-                            self.player.pos = Vec3::new(x, y, z);
-                            self.player.vel = Vec3::ZERO;
-                            self.chat_messages
-                                .push(format!("§aTeleported to ({x:.1}, {y:.1}, {z:.1})"));
+                            let target_dim = match parts.next().map(|s| s.to_ascii_lowercase()).as_deref() {
+                                Some("nether") | Some("the_nether") => DimensionId::Nether,
+                                Some("overworld") | Some("ow") => DimensionId::Overworld,
+                                _ => self.player.dimension,
+                            };
+                            self.teleport_player_to(target_dim, Vec3::new(x, y, z));
+                            self.chat_messages.push(format!(
+                                "§aTeleported to ({x:.1}, {y:.1}, {z:.1}) in {}",
+                                target_dim.label()
+                            ));
                         }
+                    }
+                }
+                "locate" => {
+                    let arg = parts.next().unwrap_or("");
+                    let info_only = parts
+                        .next()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("info"));
+                    if let Some(kind) = StructureKind::from_command_arg(arg) {
+                        let target_dim = kind.dimension();
+                        let cur_x = self.player.pos.x.floor() as i32;
+                        let cur_z = self.player.pos.z.floor() as i32;
+                        let near_xz = match (self.player.dimension, target_dim) {
+                            (DimensionId::Overworld, DimensionId::Nether) => {
+                                (cur_x.div_euclid(8), cur_z.div_euclid(8))
+                            }
+                            (DimensionId::Nether, DimensionId::Overworld) => (cur_x * 8, cur_z * 8),
+                            _ => (cur_x, cur_z),
+                        };
+                        let wt = *self.world.world_type.read();
+                        let seed = if target_dim.is_nether() {
+                            self.nether_world.seed
+                        } else {
+                            self.world.seed
+                        };
+                        if let Some(anchor) = locate_nearest_structure(kind, seed, wt, near_xz) {
+                            self.chat_messages.push(format!(
+                                "§aLocated {} at ({}, {}, {}) [{}]",
+                                kind.name(),
+                                anchor.origin.x,
+                                anchor.origin.y,
+                                anchor.origin.z,
+                                target_dim.label()
+                            ));
+                            if !info_only {
+                                self.teleport_player_to(target_dim, anchor.teleport_pos);
+                                self.chat_messages.push(format!(
+                                    "§bTeleported to {}!",
+                                    kind.name()
+                                ));
+                            }
+                        } else {
+                            self.chat_messages.push(format!(
+                                "§cCould not find {} nearby (WorldType={}).",
+                                kind.name(),
+                                wt.label()
+                            ));
+                        }
+                    } else {
+                        self.chat_messages.push(
+                            "§eUsage: /locate <fortress|bastion|monument|temple> [info]".into(),
+                        );
                     }
                 }
                 other => {
@@ -1510,6 +1997,67 @@ impl CubexEngine {
             self.chat_messages
                 .push(format!("<{}> {trimmed}", self.settings.player_name));
         }
+    }
+
+    fn teleport_player_to(&mut self, target_dim: DimensionId, target_pos: Vec3) {
+        let cx = (target_pos.x / 16.0).floor() as i32;
+        let cz = (target_pos.z / 16.0).floor() as i32;
+        {
+            let reg = self.registries.read();
+            if target_dim.is_nether() {
+                let _ = ensure_nether_columns(
+                    &self.nether_world,
+                    cx,
+                    cz,
+                    2,
+                    self.nether_world.seed,
+                    &self.nether_palette,
+                    &reg,
+                );
+                for dz in -2..=2 {
+                    for dx in -2..=2 {
+                        self.nether_generated_columns.insert((cx + dx, cz + dz));
+                    }
+                }
+                let mut pq = self.nether_world.priority_dirty_queue.write();
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        for cy in NETHER_CHUNK_Y_RANGE {
+                            pq.insert(IVec3::new(cx + dx, cy, cz + dz));
+                        }
+                    }
+                }
+            } else {
+                ensure_overworld_columns(&self.world, cx, cz, 2, &self.palette, &reg);
+                for dz in -2..=2 {
+                    for dx in -2..=2 {
+                        self.generated_columns.insert((cx + dx, cz + dz));
+                    }
+                }
+                let wt = *self.world.world_type.read();
+                let mut pq = self.world.priority_dirty_queue.write();
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        for cy in chunk_y_range_for(wt) {
+                            pq.insert(IVec3::new(cx + dx, cy, cz + dz));
+                        }
+                    }
+                }
+            }
+        }
+        self.player.dimension = target_dim;
+        self.player.pos = target_pos;
+        self.player.vel = Vec3::ZERO;
+        self.player.portal_charge = 0.0;
+        self.player.portal_cooldown = 2.0;
+        self.player.spawn_invuln_timer = self.player.spawn_invuln_timer.max(2.0);
+        self.player.wither_timer = 0.0;
+        self.player.wither_tick_accum = 0.0;
+        self.player.reset_fall_state();
+        let mut ps = self.player_state.write();
+        ps.dimension = target_dim;
+        ps.pos = target_pos;
+        ps.spawn_invuln_timer = ps.spawn_invuln_timer.max(2.0);
     }
 }
 
@@ -1595,12 +2143,14 @@ struct WindowedApp {
     hud_icons: ItemIconCache,
     form_icons: ItemIconCache,
     inv_cursor: InventoryCursor,
+    p1_creative_state: CreativeInventoryState,
     window_focused: bool,
     cursor_locked: bool,
     fullscreen: bool,
     lmb_down: bool,
     lmb_just_pressed: bool,
     rmb_just_pressed: bool,
+    mmb_just_pressed: bool,
     last_smooth_lighting: bool,
     camera_mode: CameraMode,
     gamepads: GamepadManager,
@@ -1618,6 +2168,12 @@ struct WindowedApp {
     boot_state: StartupBootState,
     splash_fade: f32,
     torch_ember_timer: f32,
+    pending_autotest_config: Option<AutoTestConfig>,
+    autotest_bot: Option<SurvivalNetherBot>,
+    pending_autotest_finish: Option<(PathBuf, AutoTestReport)>,
+    pending_qa_playthrough: Option<PathBuf>,
+    qa_bot: Option<QaPlaythroughBot>,
+    pending_qa_finish: Option<(PathBuf, PlaythroughReport)>,
 }
 
 impl Drop for WindowedApp {
@@ -1643,12 +2199,14 @@ impl WindowedApp {
             hud_icons: ItemIconCache::new(),
             form_icons: ItemIconCache::new(),
             inv_cursor: InventoryCursor::default(),
+            p1_creative_state: CreativeInventoryState::default(),
             window_focused: true,
             cursor_locked: false,
             fullscreen: false,
             lmb_down: false,
             lmb_just_pressed: false,
             rmb_just_pressed: false,
+            mmb_just_pressed: false,
             last_smooth_lighting,
             camera_mode: CameraMode::FirstPerson,
             gamepads: GamepadManager::new(),
@@ -1666,6 +2224,12 @@ impl WindowedApp {
             boot_state: StartupBootState::Ready,
             splash_fade: 0.0,
             torch_ember_timer: 0.0,
+            pending_autotest_config: None,
+            autotest_bot: None,
+            pending_autotest_finish: None,
+            pending_qa_playthrough: None,
+            qa_bot: None,
+            pending_qa_finish: None,
         }
     }
 
@@ -1687,12 +2251,14 @@ impl WindowedApp {
             hud_icons: ItemIconCache::new(),
             form_icons: ItemIconCache::new(),
             inv_cursor: InventoryCursor::default(),
+            p1_creative_state: CreativeInventoryState::default(),
             window_focused: true,
             cursor_locked: false,
             fullscreen: false,
             lmb_down: false,
             lmb_just_pressed: false,
             rmb_just_pressed: false,
+            mmb_just_pressed: false,
             last_smooth_lighting,
             camera_mode: CameraMode::FirstPerson,
             gamepads: GamepadManager::empty(),
@@ -1714,7 +2280,71 @@ impl WindowedApp {
             },
             splash_fade: 1.0,
             torch_ember_timer: 0.0,
+            pending_autotest_config: None,
+            autotest_bot: None,
+            pending_autotest_finish: None,
+            pending_qa_playthrough: None,
+            qa_bot: None,
+            pending_qa_finish: None,
         })
+    }
+
+    fn new_booting_with_cli(
+        paths: EnginePaths,
+        autotest_cfg: Option<AutoTestConfig>,
+        qa_playthrough_out: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let mut app = Self::new_booting(paths)?;
+        app.pending_autotest_config = autotest_cfg;
+        app.pending_qa_playthrough = qa_playthrough_out;
+        Ok(app)
+    }
+
+    fn boot_survival_bot_world(&mut self, world_dir_name: &str, world_label: &str) {
+        self.engine.settings.coop_mode = CoopMode::Off;
+        self.engine.settings.touch_controls = false;
+        let world_dir = std::env::temp_dir().join(world_dir_name);
+        let _ = std::fs::remove_dir_all(&world_dir);
+        let _ = std::fs::create_dir_all(&world_dir);
+        let info = WorldInfo {
+            name: world_label.into(),
+            path: world_dir,
+            gamemode: "Survival".into(),
+            seed: SURVIVAL_NETHER_SEED,
+            world_type: WorldGenType::Default,
+            difficulty: Difficulty::Normal,
+            gamerules: Gamerules::default(),
+        };
+        if let Some(ref mut r) = self.renderer {
+            self.engine.enter_world(info, r);
+        }
+        self.engine.player.gamemode = GameMode::Survival;
+        self.engine.player.dimension = DimensionId::Overworld;
+        self.engine.player.hp = 20;
+        self.engine.player.hunger = 20;
+        self.engine.player.saturation = 5.0;
+        self.engine.player.is_dead = false;
+        self.engine.player.selected_slot = 0;
+        self.engine.player.reset_fall_state();
+        {
+            let mut ps = self.engine.player_state.write();
+            ps.hp = 20;
+            ps.hunger = 20;
+            ps.wield_index = 1;
+            let mut mg = ps.meta.write();
+            mg.inventories.insert("main".into(), vec![ItemStackData::default(); 32]);
+            mg.inventories.insert("craft".into(), vec![ItemStackData::default(); 9]);
+            mg.inventories.insert("craftpreview".into(), vec![ItemStackData::default(); 1]);
+            mg.inventories.insert("armor".into(), vec![ItemStackData::default(); 4]);
+            mg.inventories.insert("offhand".into(), vec![ItemStackData::default(); 1]);
+        }
+        self.engine.last_inv_total_count = 0;
+        self.engine.active_formspec = None;
+        self.engine.chat_typing = None;
+        if let Some(ref rt) = self.engine.lua_rt {
+            *rt.shared.time_of_day.write() = 0.28;
+        }
+        self.set_cursor_locked(false);
     }
 
     fn drop_secondary_windows(&mut self) {
@@ -1977,11 +2607,14 @@ impl WindowedApp {
                     self.engine.generated_columns = bundle.generated_columns;
                     self.engine.panorama_center = bundle.panorama_center;
                     self.engine.panorama_fog_dist = 92.0;
+                    self.engine.refresh_available_skins();
 
                     if let Some(ref mut r) = self.renderer {
                         r.reload_atlas(&self.engine.atlas);
                         r.fog_dist_override = Some(self.engine.panorama_fog_dist);
                     }
+                    self.engine
+                        .sync_skins_and_props(self.renderer.as_mut(), Some(&self.egui_ctx), false);
 
                     let total = bundle.meshes.len();
                     let pending = VecDeque::from(bundle.meshes);
@@ -2034,6 +2667,25 @@ impl WindowedApp {
                         "[STARTUP] Title Screen 3D Panorama ready ({uploaded} chunks uploaded) in {:.0} ms",
                         started_at.elapsed().as_secs_f64() * 1000.0
                     );
+                    if let Some(out_dir) = self.pending_qa_playthrough.take() {
+                        self.pending_autotest_config = None;
+                        self.boot_survival_bot_world("cubex_rs_qa_playthrough", "QA_Survival_Nether");
+                        self.qa_bot = Some(QaPlaythroughBot::new(out_dir, self.engine.player.pos));
+                        println!(
+                            "[QA BOT] Started live 7-stage QA Playthrough Bot on seed {}",
+                            SURVIVAL_NETHER_SEED
+                        );
+                    } else if let Some(cfg) = self.pending_autotest_config.take() {
+                        self.boot_survival_bot_world(
+                            "cubex_rs_autotest_survival_nether",
+                            "AutoTest_Survival_Nether",
+                        );
+                        self.autotest_bot = Some(SurvivalNetherBot::new(cfg, self.engine.player.pos));
+                        println!(
+                            "[AUTOBOT] Started Survival-to-Nether AutoBot on seed {}",
+                            SURVIVAL_NETHER_SEED
+                        );
+                    }
                 } else {
                     self.boot_state = StartupBootState::UploadingPanorama {
                         started_at,
@@ -2055,6 +2707,10 @@ impl WindowedApp {
             && self.engine.active_formspec.is_none()
             && self.engine.chat_typing.is_none()
             && !self.engine.settings.touch_controls
+            && self.autotest_bot.is_none()
+            && self.pending_autotest_config.is_none()
+            && self.qa_bot.is_none()
+            && self.pending_qa_playthrough.is_none()
     }
 
     fn is_gameplay_captured(&self) -> bool {
@@ -2067,6 +2723,7 @@ impl WindowedApp {
             self.cursor_locked = false;
             self.lmb_down = false;
             self.rmb_just_pressed = false;
+            self.mmb_just_pressed = false;
             if let Some(ref win) = self.window {
                 let _ = win.set_cursor_grab(CursorGrabMode::None);
                 win.set_cursor_visible(true);
@@ -2114,13 +2771,22 @@ impl WindowedApp {
     }
 
     fn close_active_formspec(&mut self) {
+        let was_creative = self
+            .engine
+            .active_formspec
+            .as_ref()
+            .is_some_and(|f| f.formname == CREATIVE_INVENTORY_FORMNAME);
         self.engine.active_formspec = None;
-        self.return_cursor_to_inventory();
-        {
-            let ps = self.engine.player_state.read();
-            let reg = self.engine.registries.read();
-            ensure_craft_grid_size(&ps.meta, 4);
-            refresh_craft_preview(&ps.meta, &reg);
+        if was_creative {
+            self.inv_cursor.clear();
+        } else {
+            self.return_cursor_to_inventory();
+            {
+                let ps = self.engine.player_state.read();
+                let reg = self.engine.registries.read();
+                ensure_craft_grid_size(&ps.meta, 4);
+                refresh_craft_preview(&ps.meta, &reg);
+            }
         }
         if self.engine.mode == AppMode::Playing && self.engine.chat_typing.is_none() {
             self.set_cursor_locked(true);
@@ -2131,23 +2797,79 @@ impl WindowedApp {
         let Some(peer) = self.engine.peers.get_mut(slot.saturating_sub(1)) else {
             return;
         };
+        let was_creative = peer
+            .active_formspec
+            .as_ref()
+            .is_some_and(|f| f.formname == CREATIVE_INVENTORY_FORMNAME);
         peer.active_formspec = None;
         let held = std::mem::take(&mut peer.inv_cursor.held);
-        if !held.is_empty() {
-            let ps = peer.player_state.read();
-            let mut mg = ps.meta.write();
-            let main_slots = mg
-                .inventories
-                .entry("main".into())
-                .or_insert_with(|| vec![ItemStackData::default(); 36]);
-            let mut src = vec![held];
-            shift_transfer_slot(&mut src, 0, main_slots, 64);
+        if !was_creative {
+            if !held.is_empty() {
+                let ps = peer.player_state.read();
+                let mut mg = ps.meta.write();
+                let main_slots = mg
+                    .inventories
+                    .entry("main".into())
+                    .or_insert_with(|| vec![ItemStackData::default(); 36]);
+                let mut src = vec![held];
+                shift_transfer_slot(&mut src, 0, main_slots, 64);
+            }
+            {
+                let ps = peer.player_state.read();
+                let reg = self.engine.registries.read();
+                ensure_craft_grid_size(&ps.meta, 4);
+                refresh_craft_preview(&ps.meta, &reg);
+            }
         }
-        {
-            let ps = peer.player_state.read();
-            let reg = self.engine.registries.read();
-            ensure_craft_grid_size(&ps.meta, 4);
-            refresh_craft_preview(&ps.meta, &reg);
+    }
+
+    fn open_loot_chest_formspec(&mut self, slot: usize, pos: IVec3) {
+        let dim = if slot == 0 {
+            self.engine.player.dimension
+        } else if let Some(p) = self.engine.peers.get(slot - 1) {
+            p.player.dimension
+        } else {
+            return;
+        };
+        let w = world_for(&self.engine.world, &self.engine.nether_world, dim);
+        let title = w
+            .peek_node_meta(pos)
+            .and_then(|m| m.read().fields.get("infotext").cloned())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Loot Chest".into());
+        let raw = build_loot_chest_formspec(pos, &title);
+        let parsed = parse_formspec(&raw);
+        self.engine.audio.play_named(
+            "default_chest_open",
+            0.7,
+            1.0,
+            SoundCategory::Blocks,
+            &self.engine.settings.audio,
+        );
+        let formname = format!("cubex:chest:{},{},{}", pos.x, pos.y, pos.z);
+        if slot == 0 {
+            self.inv_cursor.clear();
+            self.engine.active_formspec = Some(ActiveFormspec {
+                formname,
+                raw_formspec: raw,
+                parsed,
+                context_pos: Some(pos),
+            });
+            self.p1_form_slot = 0;
+            self.engine.move_input = MoveInput::default();
+            self.engine.digger.reset();
+            self.set_cursor_locked(false);
+        } else if let Some(peer) = self.engine.peers.get_mut(slot - 1) {
+            peer.inv_cursor.clear();
+            peer.active_formspec = Some(ActiveFormspec {
+                formname,
+                raw_formspec: raw,
+                parsed,
+                context_pos: Some(pos),
+            });
+            peer.form_slot_idx = 0;
+            peer.move_input = MoveInput::default();
+            peer.digger.reset();
         }
     }
 
@@ -2222,6 +2944,23 @@ impl WindowedApp {
         let Some(peer) = self.engine.peers.get_mut(slot.saturating_sub(1)) else {
             return;
         };
+        if peer.player.gamemode == GameMode::Creative {
+            peer.inv_cursor.clear();
+            {
+                let reg = self.engine.registries.read();
+                peer.creative_state.ensure_synced(&reg);
+            }
+            peer.active_formspec = Some(ActiveFormspec {
+                formname: CREATIVE_INVENTORY_FORMNAME.into(),
+                raw_formspec: String::new(),
+                parsed: ParsedFormspec::default(),
+                context_pos: None,
+            });
+            peer.form_slot_idx = 0;
+            peer.move_input = MoveInput::default();
+            peer.digger.reset();
+            return;
+        }
         let held = std::mem::take(&mut peer.inv_cursor.held);
         if !held.is_empty() {
             let ps = peer.player_state.read();
@@ -2436,6 +3175,20 @@ impl WindowedApp {
         self.set_cursor_locked(false);
         self.engine.move_input = MoveInput::default();
         self.engine.digger.reset();
+        if self.engine.player.gamemode == GameMode::Creative {
+            self.inv_cursor.clear();
+            {
+                let reg = self.engine.registries.read();
+                self.p1_creative_state.ensure_synced(&reg);
+            }
+            self.engine.active_formspec = Some(ActiveFormspec {
+                formname: CREATIVE_INVENTORY_FORMNAME.into(),
+                raw_formspec: String::new(),
+                parsed: ParsedFormspec::default(),
+                context_pos: None,
+            });
+            return;
+        }
         self.return_cursor_to_inventory();
         {
             let ps = self.engine.player_state.read();
@@ -2469,6 +3222,7 @@ impl ApplicationHandler for WindowedApp {
         let mut renderer = WgpuRenderer::new_windowed(win.clone(), &self.engine.atlas)
             .expect("initialize wgpu renderer");
         renderer.set_vsync(self.engine.settings.vsync);
+        renderer.set_anisotropy_quality(self.engine.settings.anisotropy_quality);
         let egui_state = egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -2486,6 +3240,8 @@ impl ApplicationHandler for WindowedApp {
         self.theme = Some(theme);
         self.egui_state = Some(egui_state);
         self.renderer = Some(renderer);
+        self.engine
+            .sync_skins_and_props(self.renderer.as_mut(), Some(&self.egui_ctx), false);
         win.request_redraw();
         self.window = Some(win);
     }
@@ -2693,6 +3449,8 @@ impl ApplicationHandler for WindowedApp {
                         }
                     } else if button == MouseButton::Right && down {
                         self.rmb_just_pressed = true;
+                    } else if button == MouseButton::Middle && down {
+                        self.mmb_just_pressed = true;
                     }
                     return;
                 }
@@ -2805,6 +3563,33 @@ impl ApplicationHandler for WindowedApp {
                     return;
                 }
                 if pressed && code == KeyCode::Escape {
+                    if self.autotest_bot.is_some()
+                        || self.pending_autotest_config.is_some()
+                        || self.qa_bot.is_some()
+                        || self.pending_qa_playthrough.is_some()
+                    {
+                        let was_qa = self.qa_bot.is_some() || self.pending_qa_playthrough.is_some();
+                        self.autotest_bot = None;
+                        self.pending_autotest_config = None;
+                        self.pending_autotest_finish = None;
+                        self.qa_bot = None;
+                        self.pending_qa_playthrough = None;
+                        self.pending_qa_finish = None;
+                        self.engine.move_input = MoveInput::default();
+                        self.engine.digger.reset();
+                        self.lmb_down = false;
+                        self.lmb_just_pressed = false;
+                        self.rmb_just_pressed = false;
+                        self.engine.chat_messages.push(if was_qa {
+                            "§e[QA BOT] Cancelled by user (manual control restored).".into()
+                        } else {
+                            "§e[AUTOBOT] Cancelled by user (manual control restored).".into()
+                        });
+                        if self.engine.mode == AppMode::Playing {
+                            self.set_cursor_locked(true);
+                        }
+                        return;
+                    }
                     if self.engine.active_formspec.is_some() {
                         self.close_active_formspec();
                     } else if self.engine.chat_typing.is_some() {
@@ -2847,7 +3632,7 @@ impl ApplicationHandler for WindowedApp {
                     }
                 }
 
-                // Formspec overlay open: allow E to close player inventory cleanly
+                // Formspec overlay open: allow E to close player inventory cleanly (unless typing in search)
                 if self.engine.mode == AppMode::Playing && self.engine.active_formspec.is_some() {
                     let inv_key = self
                         .engine
@@ -2857,11 +3642,12 @@ impl ApplicationHandler for WindowedApp {
                         .map(String::as_str);
                     if pressed
                         && keycode_matches(code, inv_key, KeyCode::KeyE)
+                        && !self.egui_ctx.wants_keyboard_input()
                         && self
                             .engine
                             .active_formspec
                             .as_ref()
-                            .map(|f| f.formname == "cubex:inventory")
+                            .map(|f| is_player_inventory_formname(&f.formname))
                             .unwrap_or(false)
                     {
                         self.close_active_formspec();
@@ -2899,19 +3685,11 @@ impl ApplicationHandler for WindowedApp {
                         }
                     }
                     if pressed && keycode_matches(code, kb.get("keymap_drop").map(String::as_str), KeyCode::KeyQ) {
-                        let slot = self.engine.player.selected_slot.min(8);
-                        let ps = self.engine.player_state.read();
-                        let mut mg = ps.meta.write();
-                        if let Some(inv) = mg.inventories.get_mut("main") {
-                            if let Some(st) = inv.get_mut(slot) {
-                                if !st.is_empty() {
-                                    st.count = st.count.saturating_sub(1);
-                                    if st.count == 0 {
-                                        *st = Default::default();
-                                    }
-                                }
-                            }
-                        }
+                        drop_held_slot_item(
+                            &self.engine.player,
+                            &self.engine.player_state,
+                            self.engine.lua_rt.as_ref(),
+                        );
                     }
 
                     if pressed {
@@ -3223,8 +4001,19 @@ impl WindowedApp {
                     match rx.try_recv() {
                         Ok((col, chunks)) => {
                             drained += 1;
+                            let seed = self.engine.world.seed;
+                            let wt = *self.engine.world.world_type.read();
+                            let reg = self.engine.registries.read();
                             for ch in chunks {
+                                let cpos = ch.pos;
                                 self.engine.world.insert_chunk(ch);
+                                populate_structure_chests_for_chunk(
+                                    &self.engine.world,
+                                    cpos,
+                                    seed,
+                                    wt,
+                                    &reg,
+                                );
                             }
                             if let Some(&col_idx) = col_index_map.get(&col) {
                                 if !ready_columns[col_idx] {
@@ -3258,6 +4047,8 @@ impl WindowedApp {
 
                 // All initial terrain columns are inserted; finalize player position on safe surface
                 self.engine.finalize_loaded_player_spawn(had_saved_player);
+                self.engine
+                    .sync_skins_and_props(self.renderer.as_mut(), Some(&self.egui_ctx), false);
 
                 let side = (radius * 2 + 1).max(1) as usize;
                 let present_coords: Vec<IVec3> = {
@@ -3329,7 +4120,11 @@ impl WindowedApp {
                             return;
                         }
                         let mesh = mesh_chunk_with_atlas(&snap, &reg, &atlas_arc, smooth);
-                        let _ = tx.send(MeshedChunkPacket { epoch, mesh });
+                        let _ = tx.send(MeshedChunkPacket {
+                            epoch,
+                            dimension: DimensionId::Overworld,
+                            mesh,
+                        });
                     });
                 });
 
@@ -3443,7 +4238,6 @@ impl WindowedApp {
             let sw = &mut self.secondary_windows[sec_idx];
             sw.egui_state.take_egui_input(&sw.window)
         };
-        let chunks_loaded = self.engine.world.chunks.read().len();
         let (visible_chunks, draw_calls, adapter_name) = match self.renderer.as_ref() {
             Some(r) => (
                 r.last_visible_chunks,
@@ -3457,22 +4251,24 @@ impl WindowedApp {
         let mut peer_death_respawns: Vec<usize> = Vec::new();
         let mut built_vp_px: Vec<(usize, [u32; 4])> = Vec::new();
 
-        let (output_sec, nametag_targets): (egui::FullOutput, Vec<(String, Vec3)>) = {
-            let mut tags = Vec::new();
+        let (output_sec, nametag_targets): (egui::FullOutput, Vec<(String, Vec3, DimensionId)>) = {
+            let mut tags: Vec<(String, Vec3, DimensionId)> = Vec::new();
             tags.push((
                 self.engine.settings.player_name.clone(),
                 self.engine.player.pos,
+                self.engine.player.dimension,
             ));
             for (i, p) in self.engine.peers.iter().enumerate() {
                 if p.joined {
                     tags.push((
                         self.engine.settings.player_name_for_slot(i + 1).to_string(),
                         p.player.pos,
+                        p.player.dimension,
                     ));
                 }
             }
             for rp in self.engine.remote_players.values() {
-                tags.push((rp.name.clone(), rp.pos));
+                tags.push((rp.name.clone(), rp.pos, DimensionId::Overworld));
             }
             (
                 {
@@ -3531,10 +4327,11 @@ impl WindowedApp {
                             };
                             let peer_cam_pos = self.engine.peers[peer_idx].cam_pos;
                             let peer_vp = self.engine.peers[peer_idx].view_proj;
+                            let peer_dim = self.engine.peers[peer_idx].player.dimension;
                             let peer_tags: Vec<(String, Vec3)> = tags
                                 .iter()
-                                .filter(|(n, _)| *n != my_name)
-                                .cloned()
+                                .filter(|(n, _, d)| *n != my_name && *d == peer_dim)
+                                .map(|(n, p, _)| (n.clone(), *p))
                                 .collect();
                             render_nametags_in_viewport(
                                 ctx,
@@ -3545,6 +4342,14 @@ impl WindowedApp {
                             );
 
                             let peer = &mut self.engine.peers[peer_idx];
+                            let peer_world = world_for(
+                                &self.engine.world,
+                                &self.engine.nether_world,
+                                peer.player.dimension,
+                            );
+                            let peer_chunks_loaded = peer_world.chunks.read().len();
+                            let peer_warp_alpha = (peer.player.portal_charge * 0.72)
+                                .max(peer.player.portal_warp_flash * 0.85);
                             let badge = match slot {
                                 1 => "P2",
                                 2 => "P3",
@@ -3577,7 +4382,7 @@ impl WindowedApp {
                                     peer.targeted.as_ref(),
                                     self.engine.fps,
                                     self.engine.frame_ms,
-                                    chunks_loaded,
+                                    peer_chunks_loaded,
                                     visible_chunks,
                                     draw_calls,
                                     &adapter_name,
@@ -3586,12 +4391,12 @@ impl WindowedApp {
                                     HudTelemetry {
                                         atlas: Some(&self.engine.atlas),
                                         icon_cache: Some(&mut peer.hud_icons),
-                                        world: Some(&self.engine.world),
+                                        world: Some(peer_world),
                                         dig_progress: peer.digger.dig_progress,
-                                        biome_name: Some(biome_name_at(
-                                            peer.player.pos.x.floor() as i32,
-                                            peer.player.pos.z.floor() as i32,
-                                            self.engine.world.seed,
+                                        biome_name: Some(biome_label_for(
+                                            peer.player.dimension,
+                                            peer.player.pos,
+                                            peer_world.seed,
                                         )),
                                         targeted_param2: peer.targeted.as_ref().map(|h| h.param2),
                                         armor_points: 0,
@@ -3599,32 +4404,65 @@ impl WindowedApp {
                                         xp_progress,
                                         player_badge: Some(badge),
                                         hurt_flash,
+                                        dimension: peer.player.dimension,
+                                        portal_warp_alpha: peer_warp_alpha,
                                     },
                                 );
                                 if let Some(ref af) = peer.active_formspec {
-                                    let (fields, close) = render_formspec_interactive(
-                                        ctx,
-                                        theme_ref,
-                                        &af.formname,
-                                        &af.parsed,
-                                        &peer.player_state,
-                                        &mut peer.formspec_fields,
-                                        FormspecContext {
-                                            world: Some(&self.engine.world),
-                                            context_pos: af.context_pos,
-                                            registries: Some(&reg),
-                                            atlas: Some(&self.engine.atlas),
-                                            icon_cache: Some(&mut peer.form_icons),
-                                            cursor: Some(&mut peer.inv_cursor),
-                                            lua_rt: self.engine.lua_rt.as_ref(),
-                                            viewport: Some(log_rect),
-                                            id_salt: (slot as u64 + 1) * 100 + 1,
-                                            controller_input: ctrl_in,
-                                            controller_slot: ctrl_in.map(|_| &mut peer.form_slot_idx),
-                                        },
-                                    );
-                                    if !fields.is_empty() || close {
-                                        peer_form_submits.push((slot, af.formname.clone(), fields, close));
+                                    if af.formname == CREATIVE_INVENTORY_FORMNAME {
+                                        let close = render_creative_inventory(
+                                            ctx,
+                                            theme_ref,
+                                            &mut peer.creative_state,
+                                            &peer.player_state,
+                                            peer.player.selected_slot,
+                                            &reg,
+                                            &self.engine.atlas,
+                                            &mut peer.form_icons,
+                                            &mut peer.inv_cursor,
+                                            log_rect,
+                                            (slot as u64 + 1) * 100 + 1,
+                                            ctrl_in,
+                                        );
+                                        if close {
+                                            peer_form_submits.push((
+                                                slot,
+                                                af.formname.clone(),
+                                                Vec::new(),
+                                                true,
+                                            ));
+                                        }
+                                    } else {
+                                        let (fields, close) = render_formspec_interactive(
+                                            ctx,
+                                            theme_ref,
+                                            &af.formname,
+                                            &af.parsed,
+                                            &peer.player_state,
+                                            &mut peer.formspec_fields,
+                                            FormspecContext {
+                                                world: Some(&self.engine.world),
+                                                context_pos: af.context_pos,
+                                                registries: Some(&reg),
+                                                atlas: Some(&self.engine.atlas),
+                                                icon_cache: Some(&mut peer.form_icons),
+                                                cursor: Some(&mut peer.inv_cursor),
+                                                lua_rt: self.engine.lua_rt.as_ref(),
+                                                viewport: Some(log_rect),
+                                                id_salt: (slot as u64 + 1) * 100 + 1,
+                                                controller_input: ctrl_in,
+                                                controller_slot: ctrl_in
+                                                    .map(|_| &mut peer.form_slot_idx),
+                                            },
+                                        );
+                                        if !fields.is_empty() || close {
+                                            peer_form_submits.push((
+                                                slot,
+                                                af.formname.clone(),
+                                                fields,
+                                                close,
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -3677,7 +4515,8 @@ impl WindowedApp {
                 .handle_platform_output(&sw.window, output_sec.platform_output.clone());
         }
 
-        let all_local_mask = self.active_local_body_mask();
+        let ow_mask = self.active_local_body_mask_in_dimension(DimensionId::Overworld);
+        let nw_mask = self.active_local_body_mask_in_dimension(DimensionId::Nether);
         let Some(ref mut r) = self.renderer else {
             return;
         };
@@ -3686,11 +4525,13 @@ impl WindowedApp {
             .map(|&(slot, px)| {
                 let peer_idx = slot - 1;
                 let peer = &self.engine.peers[peer_idx];
+                let peer_dim = peer.player.dimension;
                 let peer_show_self = r
                     .peer_slot(slot)
                     .map(|p| p.show_player_model)
                     .unwrap_or(false);
-                let mut mask = all_local_mask & !(1u8 << slot);
+                let dim_mask = if peer_dim.is_nether() { nw_mask } else { ow_mask };
+                let mut mask = dim_mask & !(1u8 << slot);
                 if peer_show_self {
                     mask |= 1u8 << slot;
                 }
@@ -3701,6 +4542,7 @@ impl WindowedApp {
                     player_slot: slot,
                     draw_local_player_mask: mask,
                     draw_viewmodel: peer.show_viewmodel,
+                    dimension: peer_dim,
                 }
             })
             .collect();
@@ -3755,10 +4597,14 @@ impl WindowedApp {
         }
     }
 
-    fn active_local_body_mask(&self) -> u8 {
-        let mut mask = 1u8;
+    fn active_local_body_mask_in_dimension(&self, dim: DimensionId) -> u8 {
+        let mut mask = if self.engine.player.dimension == dim {
+            1u8
+        } else {
+            0u8
+        };
         for (i, peer) in self.engine.peers.iter().enumerate() {
-            if peer.joined {
+            if peer.joined && peer.player.dimension == dim {
                 mask |= 1u8 << (i + 1);
             }
         }
@@ -4216,7 +5062,16 @@ impl WindowedApp {
                         && !self.engine.player.is_dead
                         && self.engine.player.spawn_invuln_timer <= 0.0
                     {
+                        let old_hp = self.engine.player.hp;
                         self.engine.player.hp = (self.engine.player.hp - dmg).max(0);
+                        log_player_damage(
+                            DamageSource::Mob,
+                            dmg,
+                            old_hp,
+                            self.engine.player.hp,
+                            self.engine.player.pos,
+                            "net_punch",
+                        );
                         if self.engine.player.hp == 0 {
                             self.engine.player.death_cause = "Slain in combat".into();
                         }
@@ -4239,7 +5094,16 @@ impl WindowedApp {
                                 && !peer.player.is_dead
                                 && peer.player.spawn_invuln_timer <= 0.0
                             {
+                                let old_hp = peer.player.hp;
                                 peer.player.hp = (peer.player.hp - dmg).max(0);
+                                log_player_damage(
+                                    DamageSource::Mob,
+                                    dmg,
+                                    old_hp,
+                                    peer.player.hp,
+                                    peer.player.pos,
+                                    "net_punch_peer",
+                                );
                                 if peer.player.hp == 0 {
                                     peer.player.death_cause = "Slain in combat".into();
                                 }
@@ -4414,6 +5278,8 @@ impl WindowedApp {
                 if let Some(ref mut r) = self.renderer {
                     let reg = self.engine.registries.read();
                     r.update_entities(&[], &reg, &self.engine.atlas);
+                    r.update_nether_entities(&[], &reg, &self.engine.atlas);
+                    r.update_guardian_lasers(&[]);
                     r.update_remote_players(&[], dt, &reg, &self.engine.atlas);
                 }
             }
@@ -4510,6 +5376,8 @@ impl WindowedApp {
             let mut p1_mine_held = self.lmb_down && self.cursor_locked;
             let mut p1_place_just = self.rmb_just_pressed && self.cursor_locked;
             let mut p1_touch_mine_just = false;
+            let mut bot_force_liquids_pointable = false;
+            let mut bot_melee_just = false;
             self.rmb_just_pressed = false;
 
             if self.engine.mode == AppMode::Playing && self.engine.settings.touch_controls {
@@ -4578,7 +5446,7 @@ impl WindowedApp {
                                 .engine
                                 .active_formspec
                                 .as_ref()
-                                .is_some_and(|f| f.formname == "cubex:inventory")
+                                .is_some_and(|f| is_player_inventory_formname(&f.formname))
                         {
                             self.close_active_formspec();
                         }
@@ -4626,8 +5494,9 @@ impl WindowedApp {
                         }
                         if gf.drop_pressed {
                             drop_held_slot_item(
+                                &self.engine.player,
                                 &self.engine.player_state,
-                                self.engine.player.selected_slot,
+                                self.engine.lua_rt.as_ref(),
                             );
                         }
                         if gf.inventory_pressed {
@@ -4675,7 +5544,7 @@ impl WindowedApp {
                                 && peer
                                     .active_formspec
                                     .as_ref()
-                                    .is_some_and(|f| f.formname == "cubex:inventory")
+                                    .is_some_and(|f| is_player_inventory_formname(&f.formname))
                             {
                                 want_close_peer_inv[idx] = true;
                             }
@@ -4725,8 +5594,9 @@ impl WindowedApp {
                             }
                             if gf.drop_pressed {
                                 drop_held_slot_item(
+                                    &peer.player,
                                     &peer.player_state,
-                                    peer.player.selected_slot,
+                                    self.engine.lua_rt.as_ref(),
                                 );
                             }
                             if gf.inventory_pressed {
@@ -4804,6 +5674,168 @@ impl WindowedApp {
                 }
             }
 
+            if self.engine.mode == AppMode::Playing && self.autotest_bot.is_some() {
+                self.engine.active_formspec = None;
+                self.engine.chat_typing = None;
+                if let Some(mut bot) = self.autotest_bot.take() {
+                    let p1_world_for_bot = world_for(
+                        &self.engine.world,
+                        &self.engine.nether_world,
+                        self.engine.player.dimension,
+                    );
+                    let p1_lua_for_bot = if self.engine.player.dimension.is_nether() {
+                        None
+                    } else {
+                        self.engine.lua_rt.as_ref()
+                    };
+                    let bot_out = {
+                        let reg = self.engine.registries.read();
+                        bot.tick(
+                            dt,
+                            self.engine.fps,
+                            &mut self.engine.player,
+                            &self.engine.player_state,
+                            p1_world_for_bot,
+                            &reg,
+                            p1_lua_for_bot,
+                            self.engine.settings.block_shatter_physics,
+                        )
+                    };
+                    p1_step_input = bot_out.move_input;
+                    p1_mine_held = bot_out.mine_held;
+                    p1_place_just = bot_out.place_just;
+                    bot_force_liquids_pointable = bot_out.force_liquids_pointable;
+                    if !bot_out.remesh_positions.is_empty() {
+                        let reg = self.engine.registries.read();
+                        if let Some(ref mut r) = self.renderer {
+                            for bpos in &bot_out.remesh_positions {
+                                r.relight_and_remesh_at(
+                                    p1_world_for_bot,
+                                    *bpos,
+                                    &reg,
+                                    &self.engine.atlas,
+                                    self.engine.settings.smooth_lighting,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(report) = bot_out.finished {
+                        self.pending_autotest_finish =
+                            Some((bot.out_dir().to_path_buf(), report));
+                    }
+                    self.autotest_bot = Some(bot);
+                }
+            } else if self.engine.mode == AppMode::Playing && self.qa_bot.is_some() {
+                self.engine.active_formspec = None;
+                self.engine.chat_typing = None;
+                if let Some(mut bot) = self.qa_bot.take() {
+                    let bot_out = {
+                        let reg = self.engine.registries.read();
+                        let p1_lua_for_bot = if self.engine.player.dimension.is_nether() {
+                            None
+                        } else {
+                            self.engine.lua_rt.as_ref()
+                        };
+                        bot.tick(
+                            dt,
+                            self.engine.fps,
+                            &mut self.engine.player,
+                            &self.engine.player_state,
+                            &self.engine.world,
+                            &self.engine.nether_world,
+                            &self.engine.palette,
+                            &self.engine.nether_palette,
+                            &reg,
+                            p1_lua_for_bot,
+                            &mut self.engine.mob_manager,
+                            self.engine.settings.block_shatter_physics,
+                        )
+                    };
+                    p1_step_input = bot_out.move_input;
+                    p1_mine_held = bot_out.mine_held;
+                    p1_place_just = bot_out.place_just;
+                    bot_melee_just = bot_out.melee_attack_just;
+                    bot_force_liquids_pointable = bot_out.force_liquids_pointable;
+
+                    if let Some((dest_dim, dest_pos)) = bot_out.teleport_request {
+                        self.engine.player.dimension = dest_dim;
+                        self.engine.player.pos = dest_pos;
+                        self.engine.player.vel = Vec3::ZERO;
+                        self.engine.player.reset_fall_state();
+                        self.engine.digger.reset();
+                        let dest_world = world_for(
+                            &self.engine.world,
+                            &self.engine.nether_world,
+                            dest_dim,
+                        );
+                        let cx = (dest_pos.x / 16.0).floor() as i32;
+                        let cz = (dest_pos.z / 16.0).floor() as i32;
+                        {
+                            let gen_set = if dest_dim.is_nether() {
+                                &mut self.engine.nether_generated_columns
+                            } else {
+                                &mut self.engine.generated_columns
+                            };
+                            for dz in -2..=2 {
+                                for dx in -2..=2 {
+                                    gen_set.insert((cx + dx, cz + dz));
+                                }
+                            }
+                        }
+                        if let Some(ref mut r) = self.renderer {
+                            let reg = self.engine.registries.read();
+                            let y_range: Vec<i32> = if dest_dim.is_nether() {
+                                NETHER_CHUNK_Y_RANGE.collect()
+                            } else {
+                                chunk_y_range_for(*dest_world.world_type.read()).collect()
+                            };
+                            for dz in -2..=2 {
+                                for dx in -2..=2 {
+                                    for &cy in &y_range {
+                                        if let Some(snap) =
+                                            dest_world.snapshot_chunk(IVec3::new(cx + dx, cy, cz + dz))
+                                        {
+                                            let mesh = mesh_chunk_with_atlas(
+                                                &snap,
+                                                &reg,
+                                                &self.engine.atlas,
+                                                self.engine.settings.smooth_lighting,
+                                            );
+                                            r.upload_chunk_mesh_for_dimension(mesh, dest_dim);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !bot_out.remesh_positions.is_empty() {
+                        let p1_world_for_bot = world_for(
+                            &self.engine.world,
+                            &self.engine.nether_world,
+                            self.engine.player.dimension,
+                        );
+                        let reg = self.engine.registries.read();
+                        if let Some(ref mut r) = self.renderer {
+                            for bpos in &bot_out.remesh_positions {
+                                r.relight_and_remesh_at(
+                                    p1_world_for_bot,
+                                    *bpos,
+                                    &reg,
+                                    &self.engine.atlas,
+                                    self.engine.settings.smooth_lighting,
+                                );
+                            }
+                        }
+                    }
+
+                    if let Some(report) = bot_out.finished {
+                        self.pending_qa_finish = Some((bot.out_dir().to_path_buf(), report));
+                    }
+                    self.qa_bot = Some(bot);
+                }
+            }
+
             // Step P1 & P2..P4 movement, physics, and Survival respawn
             let p1_active_input = self.engine.mode == AppMode::Playing
                 && self.engine.active_formspec.is_none()
@@ -4811,6 +5843,7 @@ impl WindowedApp {
             let p1_mine_just = p1_active_input
                 && ((self.lmb_just_pressed && self.cursor_locked)
                     || p1_touch_mine_just
+                    || bot_melee_just
                     || (p1_mine_held && !self.p1_mine_was_held));
             self.lmb_just_pressed = false;
             self.p1_mine_was_held = p1_mine_held && p1_active_input;
@@ -4830,13 +5863,23 @@ impl WindowedApp {
                 let keep_inv = self.engine.settings.gamerules.keep_inventory;
                 if self.engine.active_formspec.is_none() && self.engine.chat_typing.is_none() {
                     let reg = self.engine.registries.read();
+                    let p1_world = world_for(
+                        &self.engine.world,
+                        &self.engine.nether_world,
+                        self.engine.player.dimension,
+                    );
+                    let p1_lua = if self.engine.player.dimension.is_nether() {
+                        None
+                    } else {
+                        self.engine.lua_rt.as_ref()
+                    };
                     step_player_physics_and_respawn(
                         &mut self.engine.player,
                         &self.engine.player_state,
                         &p1_step_input,
-                        &self.engine.world,
+                        p1_world,
                         &reg,
-                        self.engine.lua_rt.as_ref(),
+                        p1_lua,
                         &self.engine.audio,
                         &self.engine.settings,
                         keep_inv,
@@ -4844,16 +5887,57 @@ impl WindowedApp {
                         "You",
                         dt,
                     );
+                    if let Some(new_dim) = tick_player_portal(
+                        &mut self.engine.player,
+                        &self.engine.player_state,
+                        &self.engine.world,
+                        &self.engine.nether_world,
+                        &self.engine.palette,
+                        &self.engine.nether_palette,
+                        &reg,
+                        &mut self.engine.chat_messages,
+                        "You",
+                        dt,
+                    ) {
+                        let dest_world = world_for(&self.engine.world, &self.engine.nether_world, new_dim);
+                        let (cx, cz) = (
+                            (self.engine.player.pos.x / 16.0).floor() as i32,
+                            (self.engine.player.pos.z / 16.0).floor() as i32,
+                        );
+                        let gen_set = if new_dim.is_nether() {
+                            &mut self.engine.nether_generated_columns
+                        } else {
+                            &mut self.engine.generated_columns
+                        };
+                        for dz in -1..=1 {
+                            for dx in -1..=1 {
+                                gen_set.insert((cx + dx, cz + dz));
+                            }
+                        }
+                        if let Some(ref mut r) = self.renderer {
+                            r.remesh_priority_chunks_now(
+                                dest_world,
+                                &reg,
+                                &self.engine.atlas,
+                                self.engine.settings.smooth_lighting,
+                            );
+                        }
+                    }
                 } else {
                     sync_player_lua_combat_state(
                         &mut self.engine.player,
                         &self.engine.player_state,
                         dt,
                     );
+                    let p1_lua = if self.engine.player.dimension.is_nether() {
+                        None
+                    } else {
+                        self.engine.lua_rt.as_ref()
+                    };
                     handle_player_death_if_needed(
                         &mut self.engine.player,
                         &self.engine.player_state,
-                        self.engine.lua_rt.as_ref(),
+                        p1_lua,
                         keep_inv,
                         &mut self.engine.chat_messages,
                         "You",
@@ -4878,14 +5962,24 @@ impl WindowedApp {
                         }
                         let lbl = self.engine.settings.player_name_for_slot(slot).to_string();
                         let peer = &mut self.engine.peers[idx];
+                        let pw = world_for(
+                            &self.engine.world,
+                            &self.engine.nether_world,
+                            peer.player.dimension,
+                        );
+                        let plua = if peer.player.dimension.is_nether() {
+                            None
+                        } else {
+                            self.engine.lua_rt.as_ref()
+                        };
                         if peer.active_formspec.is_none() {
                             step_player_physics_and_respawn(
                                 &mut peer.player,
                                 &peer.player_state,
                                 &peer_inputs[idx],
-                                &self.engine.world,
+                                pw,
                                 &reg,
-                                self.engine.lua_rt.as_ref(),
+                                plua,
                                 &self.engine.audio,
                                 &self.engine.settings,
                                 keep_inv,
@@ -4893,12 +5987,48 @@ impl WindowedApp {
                                 &lbl,
                                 dt,
                             );
+                            if let Some(new_dim) = tick_player_portal(
+                                &mut peer.player,
+                                &peer.player_state,
+                                &self.engine.world,
+                                &self.engine.nether_world,
+                                &self.engine.palette,
+                                &self.engine.nether_palette,
+                                &reg,
+                                &mut self.engine.chat_messages,
+                                &lbl,
+                                dt,
+                            ) {
+                                let dest_world = world_for(&self.engine.world, &self.engine.nether_world, new_dim);
+                                let (cx, cz) = (
+                                    (peer.player.pos.x / 16.0).floor() as i32,
+                                    (peer.player.pos.z / 16.0).floor() as i32,
+                                );
+                                let gen_set = if new_dim.is_nether() {
+                                    &mut self.engine.nether_generated_columns
+                                } else {
+                                    &mut self.engine.generated_columns
+                                };
+                                for dz in -1..=1 {
+                                    for dx in -1..=1 {
+                                        gen_set.insert((cx + dx, cz + dz));
+                                    }
+                                }
+                                if let Some(ref mut r) = self.renderer {
+                                    r.remesh_priority_chunks_now(
+                                        dest_world,
+                                        &reg,
+                                        &self.engine.atlas,
+                                        self.engine.settings.smooth_lighting,
+                                    );
+                                }
+                            }
                         } else {
                             sync_player_lua_combat_state(&mut peer.player, &peer.player_state, dt);
                             handle_player_death_if_needed(
                                 &mut peer.player,
                                 &peer.player_state,
-                                self.engine.lua_rt.as_ref(),
+                                plua,
                                 keep_inv,
                                 &mut self.engine.chat_messages,
                                 &lbl,
@@ -4994,17 +6124,25 @@ impl WindowedApp {
             }
 
             // Raycast, DigController, Right-Click Place/Interact, Combat (Mobs + 4-way PvP + LAN PvP)
+            let p1_world_now = world_for(
+                &self.engine.world,
+                &self.engine.nether_world,
+                self.engine.player.dimension,
+            );
             let targeted = if self.engine.mode == AppMode::Playing
                 && self.engine.active_formspec.is_none()
                 && self.engine.chat_typing.is_none()
             {
                 let reg = self.engine.registries.read();
+                let point_liq = self.engine.settings.liquids_pointable
+                    || bot_force_liquids_pointable
+                    || held_item_is_empty_bucket(&self.engine.player, &self.engine.player_state);
                 raycast_voxel_ex(
                     self.engine.player.eye_pos(),
                     self.engine.player.look_dir(),
                     5.5,
-                    self.engine.settings.liquids_pointable,
-                    &self.engine.world,
+                    point_liq,
+                    p1_world_now,
                     &reg,
                 )
             } else {
@@ -5025,11 +6163,16 @@ impl WindowedApp {
                     self.engine
                         .peers
                         .iter()
-                        .filter(|p| p.joined)
+                        .filter(|p| p.joined && p.player.dimension == self.engine.player.dimension)
                         .map(|p| p.player_state.clone())
                         .collect()
                 } else {
                     Vec::new()
+                };
+                let p1_lua_act = if self.engine.player.dimension.is_nether() {
+                    None
+                } else {
+                    self.engine.lua_rt.as_ref()
                 };
                 let p1_targeted_entity = try_melee_entity_attack(
                     0,
@@ -5042,8 +6185,9 @@ impl WindowedApp {
                     &self.engine.player_state,
                     &peer_targets_for_p1,
                     &mut self.engine.remote_players,
+                    &mut self.engine.mob_manager,
                     &self.engine.registries,
-                    self.engine.lua_rt.as_ref(),
+                    p1_lua_act,
                     &self.engine.audio,
                     &self.engine.settings,
                     self.engine.net_session.as_ref(),
@@ -5054,7 +6198,24 @@ impl WindowedApp {
                     self.engine.digger.reset();
                     self.engine.player.add_exhaustion(0.10);
                 }
-                run_player_block_actions(
+                if self.mmb_just_pressed && self.cursor_locked {
+                    self.mmb_just_pressed = false;
+                    if let Some(hit) = targeted.as_ref() {
+                        let reg = self.engine.registries.read();
+                        if pick_block_into_hotbar(
+                            &mut self.engine.player,
+                            &self.engine.player_state,
+                            hit.node_id,
+                            &reg,
+                        ) {
+                            self.engine.last_inv_total_count =
+                                total_inventory_items(&self.engine.player_state);
+                        }
+                    }
+                } else {
+                    self.mmb_just_pressed = false;
+                }
+                let p1_opened_chest = run_player_block_actions(
                     0,
                     p1_mine_held && !p1_targeted_entity,
                     p1_place_just,
@@ -5065,9 +6226,9 @@ impl WindowedApp {
                     &mut self.engine.digger,
                     &mut self.engine.last_interact_pos,
                     &mut self.engine.last_inv_total_count,
-                    &self.engine.world,
+                    p1_world_now,
                     &self.engine.registries,
-                    self.engine.lua_rt.as_ref(),
+                    p1_lua_act,
                     &self.engine.audio,
                     &self.engine.atlas,
                     &self.engine.settings,
@@ -5075,6 +6236,9 @@ impl WindowedApp {
                     self.engine.local_server.as_ref(),
                     self.renderer.as_mut(),
                 );
+                if let Some(chest_pos) = p1_opened_chest {
+                    self.open_loot_chest_formspec(0, chest_pos);
+                }
                 let pending_fs = self
                     .engine
                     .lua_rt
@@ -5100,26 +6264,41 @@ impl WindowedApp {
                     && !self.engine.peers[idx].player.is_dead
                     && self.engine.peers[idx].active_formspec.is_none()
                 {
+                    let peer_dim = self.engine.peers[idx].player.dimension;
+                    let peer_world = world_for(&self.engine.world, &self.engine.nether_world, peer_dim);
                     let targeted_peer = {
                         let reg = self.engine.registries.read();
+                        let point_liq = self.engine.settings.liquids_pointable
+                            || held_item_is_empty_bucket(
+                                &self.engine.peers[idx].player,
+                                &self.engine.peers[idx].player_state,
+                            );
                         raycast_voxel_ex(
                             self.engine.peers[idx].player.eye_pos(),
                             self.engine.peers[idx].player.look_dir(),
                             5.5,
-                            self.engine.settings.liquids_pointable,
-                            &self.engine.world,
+                            point_liq,
+                            peer_world,
                             &reg,
                         )
                     };
                     self.engine.peers[idx].targeted = targeted_peer;
 
-                    let mut other_locals = vec![self.engine.player_state.clone()];
+                    let mut other_locals = Vec::new();
+                    if self.engine.player.dimension == peer_dim {
+                        other_locals.push(self.engine.player_state.clone());
+                    }
                     for (j, op) in self.engine.peers.iter().enumerate() {
-                        if j != idx && op.joined {
+                        if j != idx && op.joined && op.player.dimension == peer_dim {
                             other_locals.push(op.player_state.clone());
                         }
                     }
 
+                    let peer_lua = if peer_dim.is_nether() {
+                        None
+                    } else {
+                        self.engine.lua_rt.as_ref()
+                    };
                     let peer = &mut self.engine.peers[idx];
                     let peer_hit_ent = try_melee_entity_attack(
                         slot,
@@ -5132,8 +6311,9 @@ impl WindowedApp {
                         &peer.player_state,
                         &other_locals,
                         &mut self.engine.remote_players,
+                        &mut self.engine.mob_manager,
                         &self.engine.registries,
-                        self.engine.lua_rt.as_ref(),
+                        peer_lua,
                         &self.engine.audio,
                         &self.engine.settings,
                         self.engine.net_session.as_ref(),
@@ -5144,7 +6324,7 @@ impl WindowedApp {
                         peer.digger.reset();
                         peer.player.add_exhaustion(0.10);
                     }
-                    run_player_block_actions(
+                    let peer_opened_chest = run_player_block_actions(
                         slot,
                         peer_mine_held[idx] && !peer_hit_ent,
                         peer_place_just[idx],
@@ -5155,9 +6335,9 @@ impl WindowedApp {
                         &mut peer.digger,
                         &mut peer.last_interact_pos,
                         &mut peer.last_inv_total_count,
-                        &self.engine.world,
+                        peer_world,
                         &self.engine.registries,
-                        self.engine.lua_rt.as_ref(),
+                        peer_lua,
                         &self.engine.audio,
                         &self.engine.atlas,
                         &self.engine.settings,
@@ -5165,6 +6345,9 @@ impl WindowedApp {
                         self.engine.local_server.as_ref(),
                         self.renderer.as_mut(),
                     );
+                    if let Some(chest_pos) = peer_opened_chest {
+                        self.open_loot_chest_formspec(slot, chest_pos);
+                    }
                     let pending_fsp = self
                         .engine
                         .lua_rt
@@ -5258,6 +6441,13 @@ impl WindowedApp {
                             analog_x: inp.move_x,
                             analog_y: inp.move_y,
                         };
+                        let sp_dim = sp.player.dimension;
+                        let sp_world = world_for(&self.engine.world, &self.engine.nether_world, sp_dim);
+                        let sp_lua = if sp_dim.is_nether() {
+                            None
+                        } else {
+                            self.engine.lua_rt.as_ref()
+                        };
                         {
                             let reg = self.engine.registries.read();
                             let keep_inv = self.engine.settings.gamerules.keep_inventory;
@@ -5265,12 +6455,24 @@ impl WindowedApp {
                                 &mut sp.player,
                                 &sp.player_state,
                                 &move_in,
-                                &self.engine.world,
+                                sp_world,
                                 &reg,
-                                self.engine.lua_rt.as_ref(),
+                                sp_lua,
                                 &self.engine.audio,
                                 &self.engine.settings,
                                 keep_inv,
+                                &mut self.engine.chat_messages,
+                                &sp.name,
+                                dt,
+                            );
+                            let _ = tick_player_portal(
+                                &mut sp.player,
+                                &sp.player_state,
+                                &self.engine.world,
+                                &self.engine.nether_world,
+                                &self.engine.palette,
+                                &self.engine.nether_palette,
+                                &reg,
                                 &mut self.engine.chat_messages,
                                 &sp.name,
                                 dt,
@@ -5301,9 +6503,16 @@ impl WindowedApp {
                                 sp.player.look_dir(),
                                 5.5,
                                 self.engine.settings.liquids_pointable,
-                                &self.engine.world,
+                                world_for(&self.engine.world, &self.engine.nether_world, sp.player.dimension),
                                 &reg,
                             )
+                        };
+                        let sp_cur_world =
+                            world_for(&self.engine.world, &self.engine.nether_world, sp.player.dimension);
+                        let sp_cur_lua = if sp.player.dimension.is_nether() {
+                            None
+                        } else {
+                            self.engine.lua_rt.as_ref()
                         };
                         let slot_id = 10 + (sid as usize);
                         let hit_ent = try_melee_entity_attack(
@@ -5317,8 +6526,9 @@ impl WindowedApp {
                             &sp.player_state,
                             &other_locals,
                             &mut self.engine.remote_players,
+                            &mut self.engine.mob_manager,
                             &self.engine.registries,
-                            self.engine.lua_rt.as_ref(),
+                            sp_cur_lua,
                             &self.engine.audio,
                             &self.engine.settings,
                             self.engine.net_session.as_ref(),
@@ -5329,7 +6539,7 @@ impl WindowedApp {
                             sp.digger.reset();
                             sp.player.add_exhaustion(0.10);
                         }
-                        run_player_block_actions(
+                        let _ = run_player_block_actions(
                             slot_id,
                             inp.attack_held && !hit_ent,
                             inp.place_just,
@@ -5340,9 +6550,9 @@ impl WindowedApp {
                             &mut sp.digger,
                             &mut sp.last_interact_pos,
                             &mut sp.last_inv_total_count,
-                            &self.engine.world,
+                            sp_cur_world,
                             &self.engine.registries,
-                            self.engine.lua_rt.as_ref(),
+                            sp_cur_lua,
                             &self.engine.audio,
                             &self.engine.atlas,
                             &self.engine.settings,
@@ -5350,6 +6560,177 @@ impl WindowedApp {
                             self.engine.local_server.as_ref(),
                             self.renderer.as_mut(),
                         );
+                    }
+                }
+            }
+
+            // Step Native Nether Mobs & Ocean Monument Guardians + AI + Projectiles + Drops
+            if self.engine.mode == AppMode::Playing {
+                let mob_players = collect_mob_player_inputs(&self.engine);
+                let mob_ev = {
+                    let reg = self.engine.registries.read();
+                    self.engine.mob_manager.step(
+                        dt,
+                        &mob_players,
+                        &self.engine.world,
+                        &self.engine.nether_world,
+                        &reg,
+                    )
+                };
+                for dmg in mob_ev.player_damages {
+                    let keep_inv = self.engine.settings.gamerules.keep_inventory;
+                    if dmg.player_slot == 0 {
+                        let p = &mut self.engine.player;
+                        if !p.is_dead && p.gamemode == GameMode::Survival && p.spawn_invuln_timer <= 0.0 {
+                            p.hp = (p.hp - dmg.damage).max(0);
+                            p.vel += dmg.knockback;
+                            if dmg.apply_wither_secs > 0.0 {
+                                p.apply_wither(dmg.apply_wither_secs);
+                            }
+                            if p.hp == 0 {
+                                p.death_cause = dmg.death_cause.into();
+                            }
+                            {
+                                let mut ps = self.engine.player_state.write();
+                                ps.hp = p.hp;
+                                ps.hurt_flash = 0.25;
+                                if p.hp == 0 {
+                                    ps.last_death_cause = dmg.death_cause.into();
+                                }
+                            }
+                            let _ = self.engine.audio.play_named(
+                                "player_damage",
+                                0.85,
+                                1.0,
+                                SoundCategory::Hostile,
+                                &self.engine.settings.audio,
+                            );
+                            let lua = if p.dimension.is_nether() {
+                                None
+                            } else {
+                                self.engine.lua_rt.as_ref()
+                            };
+                            handle_player_death_if_needed(
+                                p,
+                                &self.engine.player_state,
+                                lua,
+                                keep_inv,
+                                &mut self.engine.chat_messages,
+                                "You",
+                            );
+                        }
+                    } else if dmg.player_slot >= 1 && dmg.player_slot <= 3 {
+                        let peer = &mut self.engine.peers[dmg.player_slot - 1];
+                        if peer.joined
+                            && !peer.player.is_dead
+                            && peer.player.gamemode == GameMode::Survival
+                            && peer.player.spawn_invuln_timer <= 0.0
+                        {
+                            peer.player.hp = (peer.player.hp - dmg.damage).max(0);
+                            peer.player.vel += dmg.knockback;
+                            if dmg.apply_wither_secs > 0.0 {
+                                peer.player.apply_wither(dmg.apply_wither_secs);
+                            }
+                            if peer.player.hp == 0 {
+                                peer.player.death_cause = dmg.death_cause.into();
+                            }
+                            {
+                                let mut ps = peer.player_state.write();
+                                ps.hp = peer.player.hp;
+                                ps.hurt_flash = 0.25;
+                                if peer.player.hp == 0 {
+                                    ps.last_death_cause = dmg.death_cause.into();
+                                }
+                            }
+                            let _ = self.engine.audio.play_named(
+                                "player_damage",
+                                0.85,
+                                1.0,
+                                SoundCategory::Hostile,
+                                &self.engine.settings.audio,
+                            );
+                            let lua = if peer.player.dimension.is_nether() {
+                                None
+                            } else {
+                                self.engine.lua_rt.as_ref()
+                            };
+                            let lbl = self
+                                .engine
+                                .settings
+                                .player_name_for_slot(dmg.player_slot)
+                                .to_string();
+                            handle_player_death_if_needed(
+                                &mut peer.player,
+                                &peer.player_state,
+                                lua,
+                                keep_inv,
+                                &mut self.engine.chat_messages,
+                                &lbl,
+                            );
+                        }
+                    }
+                }
+                if !mob_ev.mob_drops.is_empty() {
+                    let reg = self.engine.registries.read();
+                    for (dim, pos, drops) in mob_ev.mob_drops {
+                        if self.engine.player.dimension == dim
+                            && !self.engine.player.is_dead
+                            && self.engine.player.pos.distance_squared(pos) <= 48.0 * 48.0
+                        {
+                            if add_drops_to_inventory(&self.engine.player_state, &drops, &reg) {
+                                self.engine.audio.play_pickup(&self.engine.settings.audio);
+                            }
+                        } else if !dim.is_nether() {
+                            if let Some(ref rt) = self.engine.lua_rt {
+                                let bpos = pos.floor().as_ivec3();
+                                for d in drops {
+                                    rt.spawn_physical_item_drop(bpos, &d);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (dim, pos, snd) in mob_ev.sounds.into_iter().take(4) {
+                    if dim == self.engine.player.dimension {
+                        let d = pos.distance(self.engine.player.pos);
+                        if d < 42.0 {
+                            let gain = (1.0 - d / 42.0).clamp(0.12, 0.85);
+                            let _ = self.engine.audio.play_named(
+                                snd,
+                                gain,
+                                1.0,
+                                SoundCategory::Hostile,
+                                &self.engine.settings.audio,
+                            );
+                        }
+                    }
+                }
+                if let Some(ref mut r) = self.renderer {
+                    for pev in mob_ev.particles {
+                        let psys = r.particles_for_mut(pev.dimension);
+                        for _ in 0..pev.count {
+                            match pev.kind {
+                                MobParticleKind::Flame => psys.spawn_torch_ember(pev.pos),
+                                MobParticleKind::Smoke => psys.spawn_nether_ash(pev.pos),
+                                MobParticleKind::LaserHit => psys.spawn_portal_spark(pev.pos),
+                                MobParticleKind::Explosion => {
+                                    psys.spawn_explosion_burst(pev.pos, 1);
+                                }
+                            }
+                        }
+                    }
+                    if !mob_ev.modified_blocks.is_empty() {
+                        let reg = self.engine.registries.read();
+                        for (dim, bpos) in mob_ev.modified_blocks {
+                            let w = world_for(&self.engine.world, &self.engine.nether_world, dim);
+                            r.relight_and_remesh_at(
+                                w,
+                                bpos,
+                                &reg,
+                                &self.engine.atlas,
+                                self.engine.settings.smooth_lighting,
+                            );
+                        }
                     }
                 }
             }
@@ -5498,12 +6879,17 @@ impl WindowedApp {
 
             let rig = {
                 let reg = self.engine.registries.read();
+                let p1_cam_world = world_for(
+                    &self.engine.world,
+                    &self.engine.nether_world,
+                    self.engine.player.dimension,
+                );
                 let rig = compute_camera_rig(
                     self.camera_mode,
                     &self.engine.player,
                     player_aspects[0],
                     &self.engine.settings,
-                    &self.engine.world,
+                    p1_cam_world,
                     &reg,
                 );
                 let any_peer_joined = coop.is_active() && self.engine.peers.iter().any(|p| p.joined);
@@ -5524,12 +6910,17 @@ impl WindowedApp {
                                 .filter(|s| !s.is_empty())
                                 .map(|s| s.name.clone())
                         };
+                        let peer_cam_world = world_for(
+                            &self.engine.world,
+                            &self.engine.nether_world,
+                            self.engine.peers[idx].player.dimension,
+                        );
                         let rp = compute_camera_rig(
                             self.engine.peers[idx].camera_mode,
                             &self.engine.peers[idx].player,
                             player_aspects[slot],
                             &self.engine.settings,
-                            &self.engine.world,
+                            peer_cam_world,
                             &reg,
                         );
                         self.engine.peers[idx].cam_pos = rp.eye_pos;
@@ -5554,11 +6945,31 @@ impl WindowedApp {
                 } else {
                     self.torch_ember_timer = 0.0;
                 }
+                let mut nether_ambient_trigger = false;
+                if is_playing
+                    && (self.engine.player.dimension.is_nether()
+                        || (any_peer_joined
+                            && self
+                                .engine
+                                .peers
+                                .iter()
+                                .any(|p| p.joined && p.player.dimension.is_nether())))
+                {
+                    self.engine.nether_ambient_timer += dt;
+                    if self.engine.nether_ambient_timer >= 0.09 {
+                        self.engine.nether_ambient_timer = 0.0;
+                        nether_ambient_trigger = true;
+                    }
+                } else {
+                    self.engine.nether_ambient_timer = 0.0;
+                }
 
                 if let Some(ref mut r) = self.renderer {
                     r.set_extruded_held_items(self.engine.settings.extruded_held_items);
                     r.particles
                         .update_with_world(dt, Some(&self.engine.world), Some(&reg));
+                    r.nether_particles
+                        .update_with_world(dt, Some(&self.engine.nether_world), Some(&reg));
                     if ember_trigger {
                         let is_lit_hand = |name_opt: Option<&str>| {
                             let s = name_opt.unwrap_or("").to_ascii_lowercase();
@@ -5571,7 +6982,8 @@ impl WindowedApp {
                                 + fwd * 0.62
                                 + right * 0.28
                                 - Vec3::Y * 0.05;
-                            r.particles.spawn_torch_ember(epos);
+                            r.particles_for_mut(self.engine.player.dimension)
+                                .spawn_torch_ember(epos);
                         }
                         if any_peer_joined {
                             for idx in 0..3 {
@@ -5583,8 +6995,55 @@ impl WindowedApp {
                                         + fwd * 0.62
                                         + right * 0.28
                                         - Vec3::Y * 0.05;
-                                    r.particles.spawn_torch_ember(epos);
+                                    r.particles_for_mut(p.dimension).spawn_torch_ember(epos);
                                 }
+                            }
+                        }
+                    }
+                    if nether_ambient_trigger {
+                        use rand::Rng;
+                        let mut rng = rand::thread_rng();
+                        let mut nether_eyes = Vec::new();
+                        if self.engine.player.dimension.is_nether() {
+                            nether_eyes.push(self.engine.player.eye_pos());
+                        }
+                        if any_peer_joined {
+                            for p in &self.engine.peers {
+                                if p.joined && p.player.dimension.is_nether() {
+                                    nether_eyes.push(p.player.eye_pos());
+                                }
+                            }
+                        }
+                        for center in nether_eyes {
+                            for _ in 0..2 {
+                                let ppos = center
+                                    + Vec3::new(
+                                        rng.gen_range(-10.0..10.0),
+                                        rng.gen_range(-4.0..7.0),
+                                        rng.gen_range(-10.0..10.0),
+                                    );
+                                let gp = IVec3::new(
+                                    ppos.x.floor() as i32,
+                                    ppos.y.floor() as i32,
+                                    ppos.z.floor() as i32,
+                                );
+                                if self.engine.nether_world.get_node(gp).0 == CONTENT_AIR {
+                                    r.nether_particles.spawn_nether_ash(ppos);
+                                }
+                            }
+                            let epos = center
+                                + Vec3::new(
+                                    rng.gen_range(-10.0..10.0),
+                                    rng.gen_range(-6.0..3.0),
+                                    rng.gen_range(-10.0..10.0),
+                                );
+                            let eg = IVec3::new(
+                                epos.x.floor() as i32,
+                                epos.y.floor() as i32,
+                                epos.z.floor() as i32,
+                            );
+                            if self.engine.nether_world.get_node(eg).0 == CONTENT_AIR {
+                                r.nether_particles.spawn_nether_ember(epos);
                             }
                         }
                     }
@@ -5663,7 +7122,7 @@ impl WindowedApp {
                     }
 
                     if matches!(self.engine.mode, AppMode::Playing | AppMode::Paused) {
-                        let snapshots: Vec<EntityRenderSnapshot> = self
+                        let mut snapshots: Vec<EntityRenderSnapshot> = self
                             .engine
                             .lua_rt
                             .as_ref()
@@ -5679,7 +7138,22 @@ impl WindowedApp {
                                     .collect()
                             })
                             .unwrap_or_default();
+                        snapshots.extend(self.engine.mob_manager.render_snapshots_for(
+                            DimensionId::Overworld,
+                            &self.engine.world,
+                        ));
                         r.update_entities(&snapshots, &reg, &self.engine.atlas);
+                        let nw_snaps = self.engine.mob_manager.render_snapshots_for(
+                            DimensionId::Nether,
+                            &self.engine.nether_world,
+                        );
+                        r.update_nether_entities(&nw_snaps, &reg, &self.engine.atlas);
+                        let mob_pls = collect_mob_player_inputs(&self.engine);
+                        let beams = self
+                            .engine
+                            .mob_manager
+                            .active_laser_beams(DimensionId::Overworld, &mob_pls);
+                        r.update_guardian_lasers(&beams);
 
                         let mut remote_snaps: Vec<RemotePlayerRenderSnapshot> = self
                             .engine
@@ -5737,6 +7211,8 @@ impl WindowedApp {
                         r.update_remote_players(&remote_snaps, dt, &reg, &self.engine.atlas);
                     } else {
                         r.update_entities(&[], &reg, &self.engine.atlas);
+                        r.update_nether_entities(&[], &reg, &self.engine.atlas);
+                        r.update_guardian_lasers(&[]);
                         r.update_remote_players(&[], dt, &reg, &self.engine.atlas);
                     }
                 }
@@ -5749,35 +7225,77 @@ impl WindowedApp {
         if !matches!(self.engine.mode, AppMode::Splash | AppMode::Loading) {
             if let Some(ref mut r) = self.renderer {
                 if self.engine.mode == AppMode::Playing {
-                    let mut centers = vec![(
-                        (self.engine.player.pos.x / 16.0).floor() as i32,
-                        (self.engine.player.pos.z / 16.0).floor() as i32,
-                    )];
+                    let mut ow_centers = Vec::new();
+                    let mut nw_centers = Vec::new();
+                    let push_center = |list: &mut Vec<(i32, i32)>, pos: Vec3| {
+                        let pc = (
+                            (pos.x / 16.0).floor() as i32,
+                            (pos.z / 16.0).floor() as i32,
+                        );
+                        if !list.contains(&pc) {
+                            list.push(pc);
+                        }
+                    };
+                    if self.engine.player.dimension.is_nether() {
+                        push_center(&mut nw_centers, self.engine.player.pos);
+                    } else {
+                        push_center(&mut ow_centers, self.engine.player.pos);
+                    }
                     if self.engine.settings.coop_mode.is_active() {
                         for peer in &self.engine.peers {
                             if peer.joined {
-                                let pc = (
-                                    (peer.player.pos.x / 16.0).floor() as i32,
-                                    (peer.player.pos.z / 16.0).floor() as i32,
-                                );
-                                if !centers.contains(&pc) {
-                                    centers.push(pc);
+                                if peer.player.dimension.is_nether() {
+                                    push_center(&mut nw_centers, peer.player.pos);
+                                } else {
+                                    push_center(&mut ow_centers, peer.player.pos);
                                 }
                             }
                         }
                     }
-                    if self.engine.last_prune_chunks.as_deref() != Some(centers.as_slice()) {
-                        self.engine.last_prune_chunks = Some(centers.clone());
-                        let r_vis =
-                            (self.engine.settings.render_distance_chunks as i32).clamp(2, 32);
-                        r.prune_distant_chunks_multi(&centers, r_vis + 4);
+                    for sp in self.engine.stream_players.values() {
+                        if sp.player.dimension.is_nether() {
+                            push_center(&mut nw_centers, sp.player.pos);
+                        } else {
+                            push_center(&mut ow_centers, sp.player.pos);
+                        }
+                    }
+                    let r_vis =
+                        (self.engine.settings.render_distance_chunks as i32).clamp(2, 32);
+                    if self.engine.last_prune_chunks.as_deref() != Some(ow_centers.as_slice()) {
+                        self.engine.last_prune_chunks = Some(ow_centers.clone());
+                        r.prune_distant_chunks_for_dimension(
+                            DimensionId::Overworld,
+                            &ow_centers,
+                            r_vis + 4,
+                        );
                         let chunks_g = self.engine.world.chunks.read();
                         let mut dq = self.engine.world.dirty_queue.write();
                         for &cpos in chunks_g.keys() {
-                            if centers.iter().any(|&(cx, cz)| {
+                            if ow_centers.iter().any(|&(cx, cz)| {
                                 (cpos.x - cx).abs() <= r_vis && (cpos.z - cz).abs() <= r_vis
                             }) && !r.chunk_meshes.contains_key(&cpos)
                                 && !self.engine.meshing_in_flight.contains(&cpos)
+                            {
+                                dq.insert(cpos);
+                            }
+                        }
+                    }
+                    if self.engine.last_nether_prune_chunks.as_deref() != Some(nw_centers.as_slice())
+                    {
+                        self.engine.last_nether_prune_chunks = Some(nw_centers.clone());
+                        let nr_vis = r_vis.min(12);
+                        r.prune_distant_chunks_for_dimension(
+                            DimensionId::Nether,
+                            &nw_centers,
+                            nr_vis + 4,
+                        );
+                        let chunks_g = self.engine.nether_world.chunks.read();
+                        let mut dq = self.engine.nether_world.dirty_queue.write();
+                        for &cpos in chunks_g.keys() {
+                            if nw_centers.iter().any(|&(cx, cz)| {
+                                (cpos.x - cx).abs() <= nr_vis && (cpos.z - cz).abs() <= nr_vis
+                            }) && !r.nether_chunk_meshes.contains_key(&cpos)
+                                && !self.engine.nether_meshing_in_flight.contains(&cpos)
                             {
                                 dq.insert(cpos);
                             }
@@ -5792,13 +7310,35 @@ impl WindowedApp {
                     &self.engine.atlas,
                     self.engine.settings.smooth_lighting,
                 );
+                r.remesh_priority_chunks_now(
+                    &self.engine.nether_world,
+                    &reg,
+                    &self.engine.atlas,
+                    self.engine.settings.smooth_lighting,
+                );
                 drop(reg);
                 let (up_count, up_ms) = if self.engine.pending_meshes.len() > 24 {
                     (24, 2.0)
                 } else {
                     (16, 1.2)
                 };
-                r.upload_meshes_budgeted(&mut self.engine.pending_meshes, up_count, up_ms);
+                r.upload_meshes_budgeted_for_dimension(
+                    &mut self.engine.pending_meshes,
+                    up_count,
+                    up_ms,
+                    DimensionId::Overworld,
+                );
+                let (nup_count, nup_ms) = if self.engine.nether_pending_meshes.len() > 24 {
+                    (24, 2.0)
+                } else {
+                    (16, 1.2)
+                };
+                r.upload_meshes_budgeted_for_dimension(
+                    &mut self.engine.nether_pending_meshes,
+                    nup_count,
+                    nup_ms,
+                    DimensionId::Nether,
+                );
             }
         }
 
@@ -5847,7 +7387,14 @@ impl WindowedApp {
         let mut form_submit: Option<(String, Vec<(String, String)>, bool)> = None;
         let mut peer_form_submits: Vec<(usize, String, Vec<(String, String)>, bool)> = Vec::new();
 
-        let chunks_loaded = self.engine.world.chunks.read().len();
+        let chunks_loaded = world_for(
+            &self.engine.world,
+            &self.engine.nether_world,
+            self.engine.player.dimension,
+        )
+        .chunks
+        .read()
+        .len();
         let (visible_chunks, draw_calls, adapter_name, elapsed_sec, surf_w, surf_h) = self
             .renderer
             .as_ref()
@@ -5867,56 +7414,62 @@ impl WindowedApp {
             let ps = self.engine.player_state.read();
             (ps.xp_level, ps.xp_progress, ps.hurt_flash, ps.name.clone())
         };
-        let mut all_world_tags: Vec<(String, Vec3)> =
+        let mut all_world_tags: Vec<(String, Vec3, DimensionId)> =
             Vec::with_capacity(4 + self.engine.remote_players.len());
-        all_world_tags.push((p1_name.clone(), self.engine.player.pos));
+        all_world_tags.push((
+            p1_name.clone(),
+            self.engine.player.pos,
+            self.engine.player.dimension,
+        ));
         for (idx, peer) in self.engine.peers.iter().enumerate() {
             if peer.joined {
                 all_world_tags.push((
                     self.engine.settings.player_name_for_slot(idx + 1).to_string(),
                     peer.player.pos,
+                    peer.player.dimension,
                 ));
             }
         }
         for rp in self.engine.remote_players.values() {
-            all_world_tags.push((rp.name.clone(), rp.pos));
+            all_world_tags.push((rp.name.clone(), rp.pos, DimensionId::Overworld));
         }
 
         let mut primary_vp_specs: Vec<(usize, [u32; 4])> = Vec::new();
         let mut new_last_touch_vp = self.last_touch_viewport;
-        let output = self.egui_ctx.run(raw_input, |ctx| match self.engine.mode {
-            AppMode::Splash => {
-                if let Some(ref info) = splash_info {
-                    render_splash_screen(ctx, info, elapsed_sec, 1.0);
-                }
-            }
-            AppMode::Title => {
-                let servers_file = self.engine.paths.cubex_data_dir.join("servers.json");
-                title_act = render_title_screen_with_atlas(
-                    ctx,
-                    theme,
-                    &mut self.engine.title_state,
-                    &mut self.engine.settings,
-                    &self.engine.paths.worlds_dir,
-                    &servers_file,
-                    &self.engine.packs,
-                    &self.engine.tunnel,
-                    &self.engine.tokio_rt,
-                    Some(&self.engine.atlas),
-                    elapsed_sec,
-                );
-                if cur_splash_fade > 0.0 {
+        let output = self.egui_ctx.run(raw_input, |ctx| {
+            match self.engine.mode {
+                AppMode::Splash => {
                     if let Some(ref info) = splash_info {
-                        render_splash_screen(ctx, info, elapsed_sec, cur_splash_fade);
+                        render_splash_screen(ctx, info, elapsed_sec, 1.0);
                     }
                 }
-            }
-            AppMode::Loading => {
-                if let Some(ref info) = loading_info {
-                    render_loading_screen(ctx, theme, info, elapsed_sec);
+                AppMode::Title => {
+                    let servers_file = self.engine.paths.cubex_data_dir.join("servers.json");
+                    title_act = render_title_screen_with_atlas(
+                        ctx,
+                        theme,
+                        &mut self.engine.title_state,
+                        &mut self.engine.settings,
+                        &self.engine.paths.worlds_dir,
+                        &servers_file,
+                        &self.engine.packs,
+                        &self.engine.tunnel,
+                        &self.engine.tokio_rt,
+                        Some(&self.engine.atlas),
+                        elapsed_sec,
+                    );
+                    if cur_splash_fade > 0.0 {
+                        if let Some(ref info) = splash_info {
+                            render_splash_screen(ctx, info, elapsed_sec, cur_splash_fade);
+                        }
+                    }
                 }
-            }
-            AppMode::Playing => {
+                AppMode::Loading => {
+                    if let Some(ref info) = loading_info {
+                        render_loading_screen(ctx, theme, info, elapsed_sec);
+                    }
+                }
+                AppMode::Playing => {
                 let reg = self.engine.registries.read();
                 let full_screen = ctx.screen_rect();
                 let mut vps = Self::compute_window_viewports(
@@ -5952,10 +7505,15 @@ impl WindowedApp {
                                 ctrl_confirm,
                             );
                         } else {
+                            let p1_dim = self.engine.player.dimension;
+                            let p1_world =
+                                world_for(&self.engine.world, &self.engine.nether_world, p1_dim);
+                            let p1_warp_alpha = (self.engine.player.portal_charge * 0.72)
+                                .max(self.engine.player.portal_warp_flash * 0.85);
                             let p1_tags: Vec<(String, Vec3)> = all_world_tags
                                 .iter()
-                                .filter(|(n, _)| *n != p1_name)
-                                .cloned()
+                                .filter(|(n, _, d)| *n != p1_name && *d == p1_dim)
+                                .map(|(n, p, _)| (n.clone(), *p))
                                 .collect();
                             render_nametags_in_viewport(ctx, vp_rect, cam_pos, view_proj, &p1_tags);
                             render_hud_in_rect(
@@ -5977,12 +7535,12 @@ impl WindowedApp {
                                 HudTelemetry {
                                     atlas: Some(&self.engine.atlas),
                                     icon_cache: Some(&mut self.hud_icons),
-                                    world: Some(&self.engine.world),
+                                    world: Some(p1_world),
                                     dig_progress: self.engine.digger.dig_progress,
-                                    biome_name: Some(biome_name_at(
-                                        self.engine.player.pos.x.floor() as i32,
-                                        self.engine.player.pos.z.floor() as i32,
-                                        self.engine.world.seed,
+                                    biome_name: Some(biome_label_for(
+                                        p1_dim,
+                                        self.engine.player.pos,
+                                        p1_world.seed,
                                     )),
                                     targeted_param2: targeted_opt.as_ref().map(|h| h.param2),
                                     armor_points: 0,
@@ -5990,6 +7548,8 @@ impl WindowedApp {
                                     xp_progress,
                                     player_badge: p1_badge,
                                     hurt_flash: p1_hurt_flash,
+                                    dimension: p1_dim,
+                                    portal_warp_alpha: p1_warp_alpha,
                                 },
                             );
                             if self.engine.settings.touch_controls
@@ -6000,29 +7560,60 @@ impl WindowedApp {
                             }
                             if let Some(ref af) = self.engine.active_formspec {
                                 let ctrl_in = slot_ctrl_inputs[0];
-                                let (fields, close) = render_formspec_interactive(
-                                    ctx,
-                                    theme,
-                                    &af.formname,
-                                    &af.parsed,
-                                    &self.engine.player_state,
-                                    &mut self.engine.formspec_fields,
-                                    FormspecContext {
-                                        world: Some(&self.engine.world),
-                                        context_pos: af.context_pos,
-                                        registries: Some(&reg),
-                                        atlas: Some(&self.engine.atlas),
-                                        icon_cache: Some(&mut self.form_icons),
-                                        cursor: Some(&mut self.inv_cursor),
-                                        lua_rt: self.engine.lua_rt.as_ref(),
-                                        viewport: Some(vp_rect),
-                                        id_salt: 101,
-                                        controller_input: ctrl_in,
-                                        controller_slot: ctrl_in.map(|_| &mut self.p1_form_slot),
-                                    },
-                                );
-                                if !fields.is_empty() || close {
-                                    form_submit = Some((af.formname.clone(), fields, close));
+                                if af.formname == CREATIVE_INVENTORY_FORMNAME {
+                                    let close = render_creative_inventory(
+                                        ctx,
+                                        theme,
+                                        &mut self.p1_creative_state,
+                                        &self.engine.player_state,
+                                        self.engine.player.selected_slot,
+                                        &reg,
+                                        &self.engine.atlas,
+                                        &mut self.form_icons,
+                                        &mut self.inv_cursor,
+                                        vp_rect,
+                                        101,
+                                        ctrl_in,
+                                    );
+                                    if close {
+                                        form_submit = Some((af.formname.clone(), Vec::new(), true));
+                                    }
+                                } else {
+                                    let p1_fs_dim = self.engine.player.dimension;
+                                    let p1_fs_world = world_for(
+                                        &self.engine.world,
+                                        &self.engine.nether_world,
+                                        p1_fs_dim,
+                                    );
+                                    let p1_fs_lua = if p1_fs_dim.is_nether() {
+                                        None
+                                    } else {
+                                        self.engine.lua_rt.as_ref()
+                                    };
+                                    let (fields, close) = render_formspec_interactive(
+                                        ctx,
+                                        theme,
+                                        &af.formname,
+                                        &af.parsed,
+                                        &self.engine.player_state,
+                                        &mut self.engine.formspec_fields,
+                                        FormspecContext {
+                                            world: Some(p1_fs_world),
+                                            context_pos: af.context_pos,
+                                            registries: Some(&reg),
+                                            atlas: Some(&self.engine.atlas),
+                                            icon_cache: Some(&mut self.form_icons),
+                                            cursor: Some(&mut self.inv_cursor),
+                                            lua_rt: p1_fs_lua,
+                                            viewport: Some(vp_rect),
+                                            id_salt: 101,
+                                            controller_input: ctrl_in,
+                                            controller_slot: ctrl_in.map(|_| &mut self.p1_form_slot),
+                                        },
+                                    );
+                                    if !fields.is_empty() || close {
+                                        form_submit = Some((af.formname.clone(), fields, close));
+                                    }
                                 }
                             }
                         }
@@ -6055,10 +7646,16 @@ impl WindowedApp {
                                 peer_death_respawns_primary.push(slot);
                             }
                         } else {
+                            let peer_dim = peer.player.dimension;
+                            let peer_world =
+                                world_for(&self.engine.world, &self.engine.nether_world, peer_dim);
+                            let peer_chunks_loaded = peer_world.chunks.read().len();
+                            let peer_warp_alpha = (peer.player.portal_charge * 0.72)
+                                .max(peer.player.portal_warp_flash * 0.85);
                             let peer_tags: Vec<(String, Vec3)> = all_world_tags
                                 .iter()
-                                .filter(|(n, _)| *n != peer_name)
-                                .cloned()
+                                .filter(|(n, _, d)| *n != peer_name && *d == peer_dim)
+                                .map(|(n, p, _)| (n.clone(), *p))
                                 .collect();
                             render_nametags_in_viewport(
                                 ctx,
@@ -6077,7 +7674,7 @@ impl WindowedApp {
                                 peer.targeted.as_ref(),
                                 self.engine.fps,
                                 self.engine.frame_ms,
-                                chunks_loaded,
+                                peer_chunks_loaded,
                                 visible_chunks,
                                 draw_calls,
                                 &adapter_name,
@@ -6086,12 +7683,12 @@ impl WindowedApp {
                                 HudTelemetry {
                                     atlas: Some(&self.engine.atlas),
                                     icon_cache: Some(&mut self.hud_icons),
-                                    world: Some(&self.engine.world),
+                                    world: Some(peer_world),
                                     dig_progress: peer.digger.dig_progress,
-                                    biome_name: Some(biome_name_at(
-                                        peer.player.pos.x.floor() as i32,
-                                        peer.player.pos.z.floor() as i32,
-                                        self.engine.world.seed,
+                                    biome_name: Some(biome_label_for(
+                                        peer_dim,
+                                        peer.player.pos,
+                                        peer_world.seed,
                                     )),
                                     targeted_param2: peer.targeted.as_ref().map(|h| h.param2),
                                     armor_points: 0,
@@ -6099,32 +7696,76 @@ impl WindowedApp {
                                     xp_progress: pxprog,
                                     player_badge: Some(badge),
                                     hurt_flash: phurt,
+                                    dimension: peer_dim,
+                                    portal_warp_alpha: peer_warp_alpha,
                                 },
                             );
                             if let Some(ref af) = peer.active_formspec {
-                                let (fields, close) = render_formspec_interactive(
-                                    ctx,
-                                    theme,
-                                    &af.formname,
-                                    &af.parsed,
-                                    &peer.player_state,
-                                    &mut peer.formspec_fields,
-                                    FormspecContext {
-                                        world: Some(&self.engine.world),
-                                        context_pos: af.context_pos,
-                                        registries: Some(&reg),
-                                        atlas: Some(&self.engine.atlas),
-                                        icon_cache: Some(&mut self.form_icons),
-                                        cursor: Some(&mut peer.inv_cursor),
-                                        lua_rt: self.engine.lua_rt.as_ref(),
-                                        viewport: Some(vp_rect),
-                                        id_salt: (slot as u64 + 1) * 100 + 2,
-                                        controller_input: ctrl_in,
-                                        controller_slot: ctrl_in.map(|_| &mut peer.form_slot_idx),
-                                    },
-                                );
-                                if !fields.is_empty() || close {
-                                    peer_form_submits.push((slot, af.formname.clone(), fields, close));
+                                if af.formname == CREATIVE_INVENTORY_FORMNAME {
+                                    let close = render_creative_inventory(
+                                        ctx,
+                                        theme,
+                                        &mut peer.creative_state,
+                                        &peer.player_state,
+                                        peer.player.selected_slot,
+                                        &reg,
+                                        &self.engine.atlas,
+                                        &mut self.form_icons,
+                                        &mut peer.inv_cursor,
+                                        vp_rect,
+                                        (slot as u64 + 1) * 100 + 2,
+                                        ctrl_in,
+                                    );
+                                    if close {
+                                        peer_form_submits.push((
+                                            slot,
+                                            af.formname.clone(),
+                                            Vec::new(),
+                                            true,
+                                        ));
+                                    }
+                                } else {
+                                    let p_fs_dim = peer.player.dimension;
+                                    let p_fs_world = world_for(
+                                        &self.engine.world,
+                                        &self.engine.nether_world,
+                                        p_fs_dim,
+                                    );
+                                    let p_fs_lua = if p_fs_dim.is_nether() {
+                                        None
+                                    } else {
+                                        self.engine.lua_rt.as_ref()
+                                    };
+                                    let (fields, close) = render_formspec_interactive(
+                                        ctx,
+                                        theme,
+                                        &af.formname,
+                                        &af.parsed,
+                                        &peer.player_state,
+                                        &mut peer.formspec_fields,
+                                        FormspecContext {
+                                            world: Some(p_fs_world),
+                                            context_pos: af.context_pos,
+                                            registries: Some(&reg),
+                                            atlas: Some(&self.engine.atlas),
+                                            icon_cache: Some(&mut self.form_icons),
+                                            cursor: Some(&mut peer.inv_cursor),
+                                            lua_rt: p_fs_lua,
+                                            viewport: Some(vp_rect),
+                                            id_salt: (slot as u64 + 1) * 100 + 2,
+                                            controller_input: ctrl_in,
+                                            controller_slot: ctrl_in
+                                                .map(|_| &mut peer.form_slot_idx),
+                                        },
+                                    );
+                                    if !fields.is_empty() || close {
+                                        peer_form_submits.push((
+                                            slot,
+                                            af.formname.clone(),
+                                            fields,
+                                            close,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -6198,6 +7839,121 @@ impl WindowedApp {
                     chunks_loaded,
                 );
             }
+            }
+            if let Some(ref bot) = self.qa_bot {
+                let st = bot.hud_status();
+                let dim_str = if self.engine.player.dimension.is_nether() {
+                    "Nether"
+                } else {
+                    "Overworld"
+                };
+                let secs = st.elapsed_secs.max(0.0) as u32;
+                let pill_text = format!(
+                    "[QA BOT] Stage {}/{} | {} | {:02}:{:02} | HP {}/20 | Food {}/20 | {} | {:.0} FPS  (Esc: Manual)",
+                    st.stage_num,
+                    st.total_stages,
+                    st.goal,
+                    secs / 60,
+                    secs % 60,
+                    self.engine.player.hp,
+                    self.engine.player.hunger,
+                    dim_str,
+                    self.engine.fps
+                );
+                egui::Area::new(egui::Id::new("cubex_qa_bot_pill"))
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgba_unmultiplied(12, 16, 22, 215))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 214, 132)))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(pill_text)
+                                        .monospace()
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(235, 245, 240)),
+                                );
+                            });
+                    });
+            } else if self.pending_qa_playthrough.is_some() {
+                let pill_text = format!(
+                    "[QA BOT] Booting Survival world (seed {})...  (Esc: Manual)",
+                    SURVIVAL_NETHER_SEED
+                );
+                egui::Area::new(egui::Id::new("cubex_qa_bot_pill"))
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgba_unmultiplied(12, 16, 22, 215))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 185, 65)))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(pill_text)
+                                        .monospace()
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(245, 240, 225)),
+                                );
+                            });
+                    });
+            } else if let Some(ref bot) = self.autotest_bot {
+                let st = bot.hud_status();
+                let dim_str = if self.engine.player.dimension.is_nether() {
+                    "Nether"
+                } else {
+                    "Overworld"
+                };
+                let pill_text = format!(
+                    "[AUTOBOT] Stage {}/5 | {} | HP {}/20 | {} | {:.0} FPS  (Esc: Cancel)",
+                    st.stage_num, st.detail, self.engine.player.hp, dim_str, self.engine.fps
+                );
+                egui::Area::new(egui::Id::new("cubex_autobot_pill"))
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgba_unmultiplied(12, 16, 22, 215))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 214, 132)))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(pill_text)
+                                        .monospace()
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(235, 245, 240)),
+                                );
+                            });
+                    });
+            } else if self.pending_autotest_config.is_some() {
+                let pill_text = format!(
+                    "[AUTOBOT] Booting Survival world (seed {})...  (Esc: Cancel)",
+                    SURVIVAL_NETHER_SEED
+                );
+                egui::Area::new(egui::Id::new("cubex_autobot_pill"))
+                    .fixed_pos(egui::pos2(10.0, 10.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgba_unmultiplied(12, 16, 22, 215))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(240, 185, 65)))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(pill_text)
+                                        .monospace()
+                                        .size(13.0)
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(245, 240, 225)),
+                                );
+                            });
+                    });
+            }
         });
         self.last_touch_viewport = new_last_touch_vp;
 
@@ -6215,14 +7971,26 @@ impl WindowedApp {
             .unwrap_or(0.35);
         let ppp = win.scale_factor() as f32;
 
-        let all_local_mask = self.active_local_body_mask();
+        let ow_mask = self.active_local_body_mask_in_dimension(DimensionId::Overworld);
+        let nw_mask = self.active_local_body_mask_in_dimension(DimensionId::Nether);
+        let p1_mask_base = if self.engine.player.dimension.is_nether() {
+            nw_mask
+        } else {
+            ow_mask
+        };
+        let autotest_capture_shapes =
+            if self.pending_autotest_finish.is_some() || self.pending_qa_finish.is_some() {
+                Some(output.shapes.clone())
+            } else {
+                None
+            };
         if let Some(ref mut r) = self.renderer {
             if primary_vp_specs.len() > 1 {
                 let cams: Vec<ViewportCamera> = primary_vp_specs
                     .iter()
                     .map(|&(slot, px)| {
                         if slot == 0 {
-                            let mut mask = all_local_mask & !(1u8 << 0);
+                            let mut mask = p1_mask_base & !(1u8 << 0);
                             if r.show_player_model {
                                 mask |= 1u8 << 0;
                             }
@@ -6233,14 +8001,17 @@ impl WindowedApp {
                                 player_slot: 0,
                                 draw_local_player_mask: mask,
                                 draw_viewmodel: r.show_viewmodel,
+                                dimension: self.engine.player.dimension,
                             }
                         } else {
                             let peer = &self.engine.peers[slot - 1];
+                            let peer_dim = peer.player.dimension;
                             let peer_show_self = r
                                 .peer_slot(slot)
                                 .map(|ps| ps.show_player_model)
                                 .unwrap_or(false);
-                            let mut mask = all_local_mask & !(1u8 << slot);
+                            let base_m = if peer_dim.is_nether() { nw_mask } else { ow_mask };
+                            let mut mask = base_m & !(1u8 << slot);
                             if peer_show_self {
                                 mask |= 1u8 << slot;
                             }
@@ -6251,6 +8022,7 @@ impl WindowedApp {
                                 player_slot: slot,
                                 draw_local_player_mask: mask,
                                 draw_viewmodel: peer.show_viewmodel,
+                                dimension: peer_dim,
                             }
                         }
                     })
@@ -6264,15 +8036,136 @@ impl WindowedApp {
                     ppp,
                 );
             } else {
-                let _ = r.render_frame(
+                let _ = r.render_frame_in_dimension(
                     cam_pos,
                     view_proj,
+                    self.engine.player.dimension,
                     tod,
                     &self.engine.settings,
                     Some(&self.egui_ctx),
                     Some(output),
                     ppp,
                 );
+            }
+
+            if let Some((out_dir, report)) = self.pending_autotest_finish.take() {
+                let _ = std::fs::create_dir_all(&out_dir);
+                let mut cap_mask = p1_mask_base & !(1u8 << 0);
+                if r.show_player_model {
+                    cap_mask |= 1u8 << 0;
+                }
+                let cap_w = surf_w.clamp(320, 1920);
+                let cap_h = surf_h.clamp(240, 1080);
+                let cam = ViewportCamera {
+                    cam_pos,
+                    view_proj,
+                    viewport_px: [0, 0, cap_w, cap_h],
+                    player_slot: 0,
+                    draw_local_player_mask: cap_mask,
+                    draw_viewmodel: r.show_viewmodel,
+                    dimension: self.engine.player.dimension,
+                };
+                let cap_egui = autotest_capture_shapes.as_ref().map(|shapes| egui::FullOutput {
+                    shapes: shapes.clone(),
+                    pixels_per_point: ppp,
+                    ..Default::default()
+                });
+                match r.capture_viewport_with_egui_rgba(
+                    cam,
+                    cap_w,
+                    cap_h,
+                    tod,
+                    &self.engine.settings,
+                    Some(&self.egui_ctx),
+                    cap_egui,
+                    ppp,
+                ) {
+                    Ok(img) => {
+                        if let Err(e) = img.save(out_dir.join("survival_nether.png")) {
+                            eprintln!("[AUTOBOT] Failed to save screenshot: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[AUTOBOT] Failed to capture viewport: {e}");
+                    }
+                }
+                if let Ok(json) = serde_json::to_string_pretty(&report) {
+                    if let Err(e) = std::fs::write(out_dir.join("report.json"), json) {
+                        eprintln!("[AUTOBOT] Failed to write report.json: {e}");
+                    }
+                }
+                println!(
+                    "[AUTOBOT] Complete: passed={} stages={}/5 dim={} hp={} avg_fps={:.1} out={}",
+                    report.passed,
+                    report.stages_completed,
+                    report.final_dimension,
+                    report.final_hp,
+                    report.avg_fps,
+                    out_dir.display()
+                );
+                self.autotest_bot = None;
+                event_loop.exit();
+            } else if let Some((out_dir, report)) = self.pending_qa_finish.take() {
+                let _ = std::fs::create_dir_all(&out_dir);
+                let mut cap_mask = p1_mask_base & !(1u8 << 0);
+                if r.show_player_model {
+                    cap_mask |= 1u8 << 0;
+                }
+                let cap_w = surf_w.clamp(320, 1920);
+                let cap_h = surf_h.clamp(240, 1080);
+                let cam = ViewportCamera {
+                    cam_pos,
+                    view_proj,
+                    viewport_px: [0, 0, cap_w, cap_h],
+                    player_slot: 0,
+                    draw_local_player_mask: cap_mask,
+                    draw_viewmodel: r.show_viewmodel,
+                    dimension: self.engine.player.dimension,
+                };
+                let cap_egui = autotest_capture_shapes.as_ref().map(|shapes| egui::FullOutput {
+                    shapes: shapes.clone(),
+                    pixels_per_point: ppp,
+                    ..Default::default()
+                });
+                match r.capture_viewport_with_egui_rgba(
+                    cam,
+                    cap_w,
+                    cap_h,
+                    tod,
+                    &self.engine.settings,
+                    Some(&self.egui_ctx),
+                    cap_egui,
+                    ppp,
+                ) {
+                    Ok(img) => {
+                        if let Err(e) = img.save(out_dir.join("qa_playthrough.png")) {
+                            eprintln!("[QA BOT] Failed to save screenshot: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[QA BOT] Failed to capture viewport: {e}");
+                    }
+                }
+                if let Ok(json) = serde_json::to_string_pretty(&report) {
+                    if let Err(e) = std::fs::write(out_dir.join("qa_playthrough_report.json"), json) {
+                        eprintln!("[QA BOT] Failed to write qa_playthrough_report.json: {e}");
+                    }
+                }
+                println!(
+                    "[QA BOT] Complete: passed={} stages={}/{} nether={} mobs={} loot={} monument={} hp={} avg_fps={:.1} out={}",
+                    report.passed,
+                    report.stages_completed,
+                    report.total_stages,
+                    report.nether_entered,
+                    report.mobs_defeated,
+                    report.chest_looted_items,
+                    report.ocean_monument_verified,
+                    report.final_hp,
+                    report.avg_fps,
+                    out_dir.display()
+                );
+                self.qa_bot = None;
+                event_loop.exit();
             }
 
             // Render & stream PC GPU frames (768x432 JPEG @ ~30 FPS) to any connected phone clients
@@ -6315,12 +8208,6 @@ impl WindowedApp {
 
                     if self.engine.last_stream_frame.elapsed().as_secs_f32() >= (1.0 / 30.0) {
                         self.engine.last_stream_frame = Instant::now();
-                        let mut all_local_mask = 1u8;
-                        for (idx, p) in self.engine.peers.iter().enumerate() {
-                            if p.joined {
-                                all_local_mask |= 1u8 << (idx + 1);
-                            }
-                        }
                         let far = (self.engine.settings.render_distance_chunks as f32 * 16.0).max(64.0);
                         let proj = glam::Mat4::perspective_rh(
                             72f32.to_radians(),
@@ -6329,6 +8216,8 @@ impl WindowedApp {
                             far,
                         );
                         for (&sid, sp) in &self.engine.stream_players {
+                            let sp_dim = sp.player.dimension;
+                            let sp_mask = if sp_dim.is_nether() { nw_mask } else { ow_mask };
                             let dir = sp.player.look_dir();
                             let eye = sp.player.eye_pos() + dir * 0.28;
                             let vp = proj * glam::Mat4::look_at_rh(eye, eye + dir, glam::Vec3::Y);
@@ -6337,8 +8226,9 @@ impl WindowedApp {
                                 view_proj: vp,
                                 viewport_px: [0, 0, 768, 432],
                                 player_slot: 0,
-                                draw_local_player_mask: all_local_mask,
+                                draw_local_player_mask: sp_mask,
                                 draw_viewmodel: false,
+                                dimension: sp_dim,
                             };
                             if let Ok(img) =
                                 r.render_stream_rgba(cam, 768, 432, tod, &self.engine.settings)
@@ -6517,8 +8407,14 @@ impl WindowedApp {
             }
             TitleAction::ApplySettings => {
                 self.engine.apply_settings_to_lua_and_disk();
+                self.engine.sync_skins_and_props(
+                    self.renderer.as_mut(),
+                    Some(&self.egui_ctx),
+                    false,
+                );
                 if let Some(ref mut r) = self.renderer {
                     r.set_vsync(self.engine.settings.vsync);
+                    r.set_anisotropy_quality(self.engine.settings.anisotropy_quality);
                 }
             }
             TitleAction::ReloadPack(p) => {
@@ -6614,10 +8510,29 @@ impl WindowedApp {
             PauseAction::SetGameMode(gm) => {
                 self.engine.player.gamemode = gm;
                 self.engine.player.flying = gm == GameMode::Spectator;
+                if gm != GameMode::Creative
+                    && self
+                        .engine
+                        .active_formspec
+                        .as_ref()
+                        .is_some_and(|f| f.formname == CREATIVE_INVENTORY_FORMNAME)
+                {
+                    self.engine.active_formspec = None;
+                    self.inv_cursor.clear();
+                }
                 for peer in &mut self.engine.peers {
                     if peer.joined {
                         peer.player.gamemode = gm;
                         peer.player.flying = gm == GameMode::Spectator;
+                        if gm != GameMode::Creative
+                            && peer
+                                .active_formspec
+                                .as_ref()
+                                .is_some_and(|f| f.formname == CREATIVE_INVENTORY_FORMNAME)
+                        {
+                            peer.active_formspec = None;
+                            peer.inv_cursor.clear();
+                        }
                     }
                 }
                 *self.engine.world.gamemode.write() = gm.label().to_string();
@@ -6646,9 +8561,15 @@ impl WindowedApp {
                 }
                 self.engine.apply_settings_to_lua_and_disk();
                 self.engine.ensure_coop_players_joined();
+                self.engine.sync_skins_and_props(
+                    self.renderer.as_mut(),
+                    Some(&self.egui_ctx),
+                    false,
+                );
                 self.sync_coop_window(event_loop);
                 if let Some(ref mut r) = self.renderer {
                     r.set_vsync(self.engine.settings.vsync);
+                    r.set_anisotropy_quality(self.engine.settings.anisotropy_quality);
                     for sw in &mut self.secondary_windows {
                         if let Some(ref mut sec) = sw.target {
                             r.set_secondary_vsync(sec, self.engine.settings.vsync);
@@ -6659,6 +8580,9 @@ impl WindowedApp {
                     self.last_smooth_lighting = self.engine.settings.smooth_lighting;
                     let keys: Vec<IVec3> = self.engine.world.chunks.read().keys().copied().collect();
                     self.engine.world.dirty_queue.write().extend(keys);
+                    let nkeys: Vec<IVec3> =
+                        self.engine.nether_world.chunks.read().keys().copied().collect();
+                    self.engine.nether_world.dirty_queue.write().extend(nkeys);
                 }
             }
             PauseAction::OpenToLan => {
@@ -7295,6 +9219,8 @@ fn run_playtest() -> anyhow::Result<()> {
                         xp_progress: 0.35,
                         player_badge: None,
                         hurt_flash: 0.0,
+                        dimension: engine.player.dimension,
+                        portal_warp_alpha: 0.0,
                     },
                 );
             }
@@ -7618,6 +9544,222 @@ fn run_bench_startup() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_qa_fuzz(seeds: usize, out_dir: PathBuf) -> anyhow::Result<()> {
+    let t0 = Instant::now();
+    let paths = EnginePaths::resolve();
+    let engine = CubexEngine::boot_base(paths)?;
+    let reg = engine.registries.read();
+    let fuzzer = run_physics_fuzzer(seeds, &reg);
+    let passed = fuzzer.passed;
+    let mut failures = Vec::new();
+    if !passed {
+        failures.extend(fuzzer.invariant_violations.clone());
+        if failures.is_empty() {
+            failures.push("Physics fuzzer failed".into());
+        }
+    }
+    let report = QaMasterReport {
+        passed,
+        mode: format!("fuzz({seeds})"),
+        timestamp_unix: unix_timestamp_now(),
+        elapsed_secs: t0.elapsed().as_secs_f64(),
+        static_audit: None,
+        fuzzer: Some(fuzzer.clone()),
+        playthrough: None,
+        visual: None,
+        failures,
+    };
+    let report_path = write_master_report(&out_dir, &report)?;
+    println!(
+        "[QA FUZZ] passed={} seeds={} scenarios={}/{} ticks={} portals={} report={}",
+        report.passed,
+        fuzzer.seeds_tested,
+        fuzzer.scenarios_passed,
+        fuzzer.scenarios_total,
+        fuzzer.total_ticks,
+        fuzzer.total_portal_cycles,
+        report_path.display()
+    );
+    anyhow::ensure!(
+        report.passed,
+        "QA physics fuzzer failed (see {})",
+        report_path.display()
+    );
+    Ok(())
+}
+
+fn run_qa_update_baselines(baselines_dir: PathBuf, out_dir: PathBuf) -> anyhow::Result<()> {
+    let t0 = Instant::now();
+    let paths = EnginePaths::resolve();
+    let engine = CubexEngine::boot_base(paths)?;
+    let reg = engine.registries.read();
+    let visual = run_visual_regression(
+        &engine.paths,
+        &reg,
+        &engine.atlas,
+        &engine.settings,
+        &out_dir,
+        &baselines_dir,
+        true,
+    )?;
+    let passed = visual.passed;
+    let failures = visual.failures.clone();
+    let report = QaMasterReport {
+        passed,
+        mode: "update_baselines".into(),
+        timestamp_unix: unix_timestamp_now(),
+        elapsed_secs: t0.elapsed().as_secs_f64(),
+        static_audit: None,
+        fuzzer: None,
+        playthrough: None,
+        visual: Some(visual.clone()),
+        failures,
+    };
+    let report_path = write_master_report(&out_dir, &report)?;
+    for fr in &visual.frames {
+        println!(
+            "[QA BASELINES] {} | luma={:.1} std={:.1} status={} out={}",
+            fr.name, fr.mean_luma, fr.rgb_stddev, fr.baseline_status, fr.output_path
+        );
+    }
+    println!(
+        "[QA BASELINES] passed={} avg_fps={:.1} 1pct_low={:.1} peak_mesh_ms={:.2} report={}",
+        visual.passed,
+        visual.telemetry.avg_fps,
+        visual.telemetry.one_percent_low_fps,
+        visual.telemetry.peak_chunk_mesh_ms,
+        report_path.display()
+    );
+    anyhow::ensure!(
+        report.passed,
+        "QA baseline generation failed (see {})",
+        report_path.display()
+    );
+    Ok(())
+}
+
+fn run_qa_suite(
+    out_dir: PathBuf,
+    baselines_dir: PathBuf,
+    fuzz_seeds: usize,
+) -> anyhow::Result<()> {
+    let t0 = Instant::now();
+    let paths = EnginePaths::resolve();
+    let engine = CubexEngine::boot_base(paths)?;
+    let reg = engine.registries.read();
+
+    println!("[QA SUITE] Phase 1: Static registry & crafting reachability audit...");
+    let static_audit = run_static_audit(&reg, &engine.atlas, engine.lua_rt.as_ref());
+    println!(
+        "[QA SUITE] Phase 1 done: passed={} nodes={} tools={} foods={} recipes={} failures={}",
+        static_audit.passed,
+        static_audit.total_nodes,
+        static_audit.total_tools,
+        static_audit.total_foods,
+        static_audit.total_recipes,
+        static_audit.failures.len()
+    );
+
+    println!("[QA SUITE] Phase 2: Physics & edge-case chaos fuzzer ({fuzz_seeds} seeds)...");
+    let fuzzer = run_physics_fuzzer(fuzz_seeds, &reg);
+    println!(
+        "[QA SUITE] Phase 2 done: passed={} scenarios={}/{} ticks={} portals={}",
+        fuzzer.passed,
+        fuzzer.scenarios_passed,
+        fuzzer.scenarios_total,
+        fuzzer.total_ticks,
+        fuzzer.total_portal_cycles
+    );
+
+    println!("[QA SUITE] Phase 3: Headless 7-stage Survival-to-Nether & Structure playthrough...");
+    let playthrough =
+        run_headless_playthrough(SURVIVAL_NETHER_SEED, &reg, engine.lua_rt.as_ref());
+    println!(
+        "[QA SUITE] Phase 3 done: passed={} stages={}/{} mobs={} loot={} monument={}",
+        playthrough.passed,
+        playthrough.stages_completed,
+        playthrough.total_stages,
+        playthrough.mobs_defeated,
+        playthrough.chest_looted_items,
+        playthrough.ocean_monument_verified
+    );
+
+    println!("[QA SUITE] Phase 4: Offscreen wgpu visual regression & perf telemetry...");
+    let visual = run_visual_regression(
+        &engine.paths,
+        &reg,
+        &engine.atlas,
+        &engine.settings,
+        &out_dir,
+        &baselines_dir,
+        false,
+    )?;
+    println!(
+        "[QA SUITE] Phase 4 done: passed={} frames={} avg_fps={:.1} 1pct_low={:.1} peak_mesh_ms={:.2}",
+        visual.passed,
+        visual.frames.len(),
+        visual.telemetry.avg_fps,
+        visual.telemetry.one_percent_low_fps,
+        visual.telemetry.peak_chunk_mesh_ms
+    );
+
+    let mut failures = Vec::new();
+    if !static_audit.passed {
+        failures.extend(static_audit.failures.iter().map(|f| format!("Phase1: {f}")));
+    }
+    if !fuzzer.passed {
+        failures.extend(
+            fuzzer
+                .invariant_violations
+                .iter()
+                .map(|f| format!("Phase2: {f}")),
+        );
+    }
+    if !playthrough.passed {
+        failures.push(format!(
+            "Phase3: {}",
+            playthrough
+                .failure_reason
+                .clone()
+                .unwrap_or_else(|| "Playthrough failed".into())
+        ));
+    }
+    if !visual.passed {
+        failures.extend(visual.failures.iter().map(|f| format!("Phase4: {f}")));
+    }
+
+    let passed = static_audit.passed
+        && fuzzer.passed
+        && playthrough.passed
+        && visual.passed
+        && failures.is_empty();
+    let report = QaMasterReport {
+        passed,
+        mode: "suite".into(),
+        timestamp_unix: unix_timestamp_now(),
+        elapsed_secs: t0.elapsed().as_secs_f64(),
+        static_audit: Some(static_audit),
+        fuzzer: Some(fuzzer),
+        playthrough: Some(playthrough),
+        visual: Some(visual),
+        failures,
+    };
+    let report_path = write_master_report(&out_dir, &report)?;
+    println!(
+        "[QA SUITE] Complete: passed={} elapsed={:.2}s report={}",
+        report.passed,
+        report.elapsed_secs,
+        report_path.display()
+    );
+    anyhow::ensure!(
+        report.passed,
+        "QA suite reported {} failure(s) (see {})",
+        report.failures.len(),
+        report_path.display()
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -7653,10 +9795,26 @@ fn main() -> anyhow::Result<()> {
         return run_dedicated_server(&world_dir, port);
     }
 
+    let qa_playthrough_out = match parse_qa_args(&args)? {
+        Some(QaCliCommand::Suite {
+            out_dir,
+            baselines_dir,
+            fuzz_seeds,
+        }) => return run_qa_suite(out_dir, baselines_dir, fuzz_seeds),
+        Some(QaCliCommand::Fuzz { seeds, out_dir }) => return run_qa_fuzz(seeds, out_dir),
+        Some(QaCliCommand::UpdateBaselines {
+            baselines_dir,
+            out_dir,
+        }) => return run_qa_update_baselines(baselines_dir, out_dir),
+        Some(QaCliCommand::Playthrough { out_dir }) => Some(out_dir),
+        None => None,
+    };
+
+    let autotest_cfg = parse_autotest_args(&args)?;
     let paths = EnginePaths::resolve();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = WindowedApp::new_booting(paths)?;
+    let mut app = WindowedApp::new_booting_with_cli(paths, autotest_cfg, qa_playthrough_out)?;
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -7739,21 +9897,232 @@ mod tests {
             assert_eq!(m[0].1, [0, 0, 1280, 720]);
         }
     }
+
+    #[test]
+    fn carterpcs_skin_auto_equips_ram_mic_in_hotbar_slot_1() {
+        let ps = Arc::new(RwLock::new(ObjectState::new_player("singleplayer")));
+        {
+            let guard = ps.read();
+            let mut mg = guard.meta.write();
+            let main = mg.inventories.get_mut("main").unwrap();
+            main[0] = ItemStackData::from_spec("mcl_core:dirt");
+            main[0].count = 5;
+        }
+
+        let mut selected_slot = 3usize;
+        equip_ram_mic_for_carterpcs(&ps, &mut selected_slot);
+        assert_eq!(selected_slot, 0);
+        {
+            let guard = ps.read();
+            assert_eq!(guard.wield_index, 1);
+            let mg = guard.meta.read();
+            let main = mg.inventories.get("main").unwrap();
+            assert_eq!(main[0].name, RAM_MIC_ITEM_ID);
+            assert_eq!(main[0].count, 1);
+            assert_eq!(main[1].name, "mcl_core:dirt");
+            assert_eq!(main[1].count, 5);
+        }
+
+        // Calling again must not create duplicate RAM mics in the inventory
+        selected_slot = 4;
+        equip_ram_mic_for_carterpcs(&ps, &mut selected_slot);
+        assert_eq!(selected_slot, 0);
+        let guard = ps.read();
+        let mg = guard.meta.read();
+        let main = mg.inventories.get("main").unwrap();
+        let mic_slots: Vec<usize> = main
+            .iter()
+            .enumerate()
+            .filter_map(|(i, st)| (!st.is_empty() && st.name == RAM_MIC_ITEM_ID).then_some(i))
+            .collect();
+        assert_eq!(mic_slots, vec![0]);
+    }
+
+    #[test]
+    fn creative_pick_block_and_creative_inventory_mode_selection() {
+        let paths = EnginePaths::resolve();
+        let mut engine = CubexEngine::boot_base(paths).expect("boot_base");
+        let stone = {
+            let mut reg = engine.registries.write();
+            reg.register_node(cubex_rs::registry::NodeDef {
+                name: "mcl_core:stone".into(),
+                description: "Stone".into(),
+                drawtype: DrawType::Normal,
+                ..Default::default()
+            })
+        };
+
+        engine.player.gamemode = GameMode::Creative;
+        engine.player.selected_slot = 2;
+        {
+            let reg = engine.registries.read();
+            assert!(pick_block_into_hotbar(
+                &mut engine.player,
+                &engine.player_state,
+                stone,
+                &reg
+            ));
+        }
+        {
+            let ps = engine.player_state.read();
+            let mg = ps.meta.read();
+            let main = mg.inventories.get("main").unwrap();
+            assert_eq!(main[2].name, "mcl_core:stone");
+            assert_eq!(main[2].count, 64);
+        }
+
+        // Switching slots then pick-blocking an existing hotbar block jumps back to slot 2
+        engine.player.selected_slot = 0;
+        {
+            let reg = engine.registries.read();
+            assert!(pick_block_into_hotbar(
+                &mut engine.player,
+                &engine.player_state,
+                stone,
+                &reg
+            ));
+        }
+        assert_eq!(engine.player.selected_slot, 2);
+
+        // open_inventory_formspec opens Creative Catalog in Creative and 2x2 Crafting in Survival
+        let mut app = WindowedApp::new(engine);
+        app.engine.mode = AppMode::Playing;
+        app.engine.player.gamemode = GameMode::Creative;
+        app.open_inventory_formspec();
+        assert_eq!(
+            app.engine
+                .active_formspec
+                .as_ref()
+                .map(|f| f.formname.as_str()),
+            Some(CREATIVE_INVENTORY_FORMNAME)
+        );
+        app.close_active_formspec();
+
+        app.engine.player.gamemode = GameMode::Survival;
+        app.open_inventory_formspec();
+        assert_eq!(
+            app.engine
+                .active_formspec
+                .as_ref()
+                .map(|f| f.formname.as_str()),
+            Some("cubex:inventory")
+        );
+    }
 }
 
-fn drop_held_slot_item(player_state: &Arc<RwLock<ObjectState>>, selected_slot: usize) {
-    let slot = selected_slot.min(8);
-    let ps = player_state.read();
-    let mut mg = ps.meta.write();
-    if let Some(inv) = mg.inventories.get_mut("main") {
-        if let Some(st) = inv.get_mut(slot) {
-            if !st.is_empty() {
-                st.count = st.count.saturating_sub(1);
-                if st.count == 0 {
-                    *st = Default::default();
+pub fn is_player_inventory_formname(formname: &str) -> bool {
+    formname == "cubex:inventory" || formname == CREATIVE_INVENTORY_FORMNAME
+}
+
+pub fn pick_block_into_hotbar(
+    player: &mut PlayerController,
+    player_state: &Arc<RwLock<ObjectState>>,
+    node_id: u16,
+    reg: &EngineRegistries,
+) -> bool {
+    if matches!(node_id, CONTENT_AIR | CONTENT_IGNORE | CONTENT_UNKNOWN) {
+        return false;
+    }
+    let node_name = reg.get_name_from_content_id(node_id).trim().to_string();
+    if node_name.is_empty()
+        || node_name == "air"
+        || node_name == "ignore"
+        || node_name == "unknown"
+    {
+        return false;
+    }
+    let stack_max = reg
+        .get_item_def(&node_name)
+        .map(|d| d.stack_max)
+        .or_else(|| reg.get_node_def(node_id).map(|d| d.stack_max))
+        .unwrap_or(64)
+        .clamp(1, 64);
+
+    let mut target_slot = player.selected_slot.min(8);
+    let mut changed = false;
+    {
+        let ps = player_state.read();
+        let mut mg = ps.meta.write();
+        let main = mg
+            .inventories
+            .entry("main".into())
+            .or_insert_with(|| vec![ItemStackData::default(); 36]);
+        if main.len() < 36 {
+            main.resize_with(36, ItemStackData::default);
+        }
+
+        if let Some(hot_idx) = main
+            .iter()
+            .take(9)
+            .position(|st| !st.is_empty() && st.name == node_name)
+        {
+            target_slot = hot_idx;
+            if player.gamemode == GameMode::Creative && main[hot_idx].count < stack_max {
+                main[hot_idx].count = stack_max;
+            }
+            changed = true;
+        } else if player.gamemode == GameMode::Creative {
+            if !main[target_slot].is_empty() {
+                if let Some(empty_hot) = main.iter().take(9).position(|st| st.is_empty()) {
+                    target_slot = empty_hot;
+                } else {
+                    let displaced = main[target_slot].clone();
+                    if let Some(empty_idx) = main.iter().skip(9).position(|st| st.is_empty()) {
+                        main[9 + empty_idx] = displaced;
+                    }
                 }
             }
+            let mut st = ItemStackData::from_spec(&node_name);
+            st.count = stack_max;
+            main[target_slot] = st;
+            changed = true;
+        } else if let Some(inv_idx) = main
+            .iter()
+            .enumerate()
+            .skip(9)
+            .find_map(|(i, st)| (!st.is_empty() && st.name == node_name).then_some(i))
+        {
+            main.swap(target_slot, inv_idx);
+            changed = true;
         }
+    }
+
+    if changed {
+        player.selected_slot = target_slot;
+        player_state.write().wield_index = target_slot + 1;
+    }
+    changed
+}
+
+fn drop_held_slot_item(
+    player: &PlayerController,
+    player_state: &Arc<RwLock<ObjectState>>,
+    lua_rt: Option<&LuaRuntime>,
+) {
+    let slot = player.selected_slot.min(8);
+    let dropped_name = {
+        let ps = player_state.read();
+        let mut mg = ps.meta.write();
+        mg.inventories.get_mut("main").and_then(|inv| {
+            inv.get_mut(slot).and_then(|st| {
+                if st.is_empty() {
+                    None
+                } else {
+                    let name = st.name.clone();
+                    st.count = st.count.saturating_sub(1);
+                    if st.count == 0 {
+                        *st = Default::default();
+                    }
+                    Some(name)
+                }
+            })
+        })
+    };
+    if let (Some(item_name), Some(rt)) = (dropped_name, lua_rt) {
+        let dir = player.look_dir().normalize_or_zero();
+        let spawn_pos = player.eye_pos() + dir * 0.75 - Vec3::Y * 0.15;
+        let vel = dir * 4.2 + Vec3::Y * 1.4;
+        let _ = rt.spawn_thrown_item_drop(spawn_pos, vel, &item_name);
     }
 }
 
@@ -7895,6 +10264,213 @@ fn find_safe_respawn_pos(world: &WorldStore, reg: &EngineRegistries) -> Vec3 {
     Vec3::new(sp.x as f32 + 0.5, sp.y as f32 + 1.0, sp.z as f32 + 0.5)
 }
 
+pub fn equip_ram_mic_for_carterpcs(
+    player_state: &Arc<RwLock<ObjectState>>,
+    selected_slot: &mut usize,
+) {
+    let mut ps = player_state.write();
+    {
+        let mut mg = ps.meta.write();
+        let main = mg
+            .inventories
+            .entry("main".into())
+            .or_insert_with(|| vec![ItemStackData::default(); 36]);
+        if main.len() < 36 {
+            main.resize(36, ItemStackData::default());
+        }
+        if main[0].name == RAM_MIC_ITEM_ID && !main[0].is_empty() {
+            main[0].count = main[0].count.max(1);
+        } else if let Some(existing_idx) = main
+            .iter()
+            .position(|st| !st.is_empty() && st.name == RAM_MIC_ITEM_ID)
+        {
+            main.swap(0, existing_idx);
+        } else {
+            if !main[0].is_empty() {
+                let displaced = main[0].clone();
+                if let Some(empty_idx) = main.iter().skip(1).position(|st| st.is_empty()) {
+                    main[1 + empty_idx] = displaced;
+                }
+            }
+            main[0] = ItemStackData::from_spec(RAM_MIC_ITEM_ID);
+        }
+    }
+    *selected_slot = 0;
+    ps.wield_index = 1;
+}
+
+#[inline]
+fn world_for<'a>(
+    ow: &'a Arc<WorldStore>,
+    nw: &'a Arc<WorldStore>,
+    dim: DimensionId,
+) -> &'a Arc<WorldStore> {
+    if dim.is_nether() {
+        nw
+    } else {
+        ow
+    }
+}
+
+#[inline]
+fn biome_label_for(dim: DimensionId, pos: Vec3, seed: u64) -> &'static str {
+    let wx = pos.x.floor() as i32;
+    let wz = pos.z.floor() as i32;
+    if dim.is_nether() {
+        nether_biome_name_at(wx, wz, seed)
+    } else {
+        biome_name_at(wx, wz, seed)
+    }
+}
+
+fn ensure_overworld_columns(
+    world: &WorldStore,
+    center_cx: i32,
+    center_cz: i32,
+    radius: i32,
+    palette: &MapgenPalette,
+    reg: &EngineRegistries,
+) {
+    let wt = *world.world_type.read();
+    let y_range = chunk_y_range_for(wt);
+    let existing: HashSet<IVec3> = world.chunks.read().keys().copied().collect();
+    let mut missing = Vec::new();
+    for cz in (center_cz - radius)..=(center_cz + radius) {
+        for cx in (center_cx - radius)..=(center_cx + radius) {
+            for cy in y_range.clone() {
+                let cpos = IVec3::new(cx, cy, cz);
+                if !existing.contains(&cpos) {
+                    missing.push(cpos);
+                }
+            }
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    let seed = world.seed;
+    let chunks: Vec<Chunk> = missing
+        .into_par_iter()
+        .map(|cpos| generate_chunk_for_world(cpos, seed, wt, palette, reg))
+        .collect();
+    let coords: Vec<IVec3> = chunks.iter().map(|c| c.pos).collect();
+    for ch in chunks {
+        world.insert_chunk(ch);
+    }
+    for &cpos in &coords {
+        populate_structure_chests_for_chunk(world, cpos, seed, wt, reg);
+    }
+    propagate_world_light(world, &coords, reg);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tick_player_portal(
+    player: &mut PlayerController,
+    player_state: &Arc<RwLock<ObjectState>>,
+    ow_world: &Arc<WorldStore>,
+    nw_world: &Arc<WorldStore>,
+    ow_palette: &MapgenPalette,
+    nw_palette: &NetherPalette,
+    reg: &EngineRegistries,
+    chat_messages: &mut Vec<String>,
+    who_label: &str,
+    dt: f32,
+) -> Option<DimensionId> {
+    player.portal_cooldown = (player.portal_cooldown - dt).max(0.0);
+    player.portal_warp_flash = (player.portal_warp_flash - dt * 1.4).max(0.0);
+    if player.is_dead {
+        player.portal_charge = 0.0;
+        return None;
+    }
+
+    let cur_world = world_for(ow_world, nw_world, player.dimension);
+    let p_feet = IVec3::new(
+        player.pos.x.floor() as i32,
+        (player.pos.y + 0.1).floor() as i32,
+        player.pos.z.floor() as i32,
+    );
+    let p_eye = IVec3::new(
+        player.pos.x.floor() as i32,
+        (player.pos.y + 1.3).floor() as i32,
+        player.pos.z.floor() as i32,
+    );
+    let (nid_f, _, p2_f) = cur_world.get_node(p_feet);
+    let (nid_e, _, p2_e) = cur_world.get_node(p_eye);
+    let feet_portal = is_nether_portal_node(nid_f, reg);
+    let eye_portal = is_nether_portal_node(nid_e, reg);
+
+    if !feet_portal && !eye_portal {
+        player.portal_charge = (player.portal_charge - dt * 2.5).max(0.0);
+        return None;
+    }
+    if player.portal_cooldown > 0.0 {
+        return None;
+    }
+
+    let rate = if player.gamemode == GameMode::Creative {
+        1.0 / 0.15
+    } else {
+        1.0 / 3.0
+    };
+    player.portal_charge = (player.portal_charge + dt * rate).min(1.0);
+    player.portal_warp_flash = player
+        .portal_warp_flash
+        .max(0.35 + player.portal_charge * 0.65);
+
+    if player.portal_charge < 1.0 {
+        return None;
+    }
+
+    let axis = if feet_portal {
+        PortalAxis::from_param2(p2_f)
+    } else {
+        PortalAxis::from_param2(p2_e)
+    };
+    let from_dim = player.dimension;
+    let to_dim = from_dim.opposite();
+    let scaled = scale_portal_coords(p_feet, from_dim, to_dim);
+    let dest_cx = scaled.x.div_euclid(16);
+    let dest_cz = scaled.z.div_euclid(16);
+    let dest_world = world_for(ow_world, nw_world, to_dim);
+
+    if to_dim.is_nether() {
+        let _ = ensure_nether_columns(
+            nw_world,
+            dest_cx,
+            dest_cz,
+            1,
+            nw_world.seed,
+            nw_palette,
+            reg,
+        );
+    } else {
+        ensure_overworld_columns(ow_world, dest_cx, dest_cz, 1, ow_palette, reg);
+    }
+
+    let stand = find_or_build_destination_portal(dest_world, reg, scaled, axis);
+    player.pos = Vec3::new(
+        stand.x as f32 + 0.5,
+        stand.y as f32 + 0.05,
+        stand.z as f32 + 0.5,
+    );
+    player.vel = Vec3::ZERO;
+    player.dimension = to_dim;
+    player.portal_charge = 0.0;
+    player.portal_cooldown = 4.0;
+    player.portal_warp_flash = 1.0;
+    player.spawn_invuln_timer = player.spawn_invuln_timer.max(2.0);
+    player.reset_fall_state();
+
+    {
+        let mut ps = player_state.write();
+        ps.pos = player.pos;
+        ps.dimension = to_dim;
+        ps.spawn_invuln_timer = ps.spawn_invuln_timer.max(2.0);
+    }
+    chat_messages.push(format!("§d{who_label} traveled to {}.", to_dim.label()));
+    Some(to_dim)
+}
+
 fn respawn_player(
     player: &mut PlayerController,
     player_state: &Arc<RwLock<ObjectState>>,
@@ -7904,8 +10480,13 @@ fn respawn_player(
     chat_messages: &mut Vec<String>,
     who_label: &str,
 ) {
+    player.dimension = DimensionId::Overworld;
+    player.portal_charge = 0.0;
+    player.portal_cooldown = 0.0;
+    player.portal_warp_flash = 0.0;
     player.pos = find_safe_respawn_pos(world, reg);
     player.vel = Vec3::ZERO;
+    player.reset_fall_state();
     player.hp = 20;
     player.hunger = 20;
     player.saturation = 5.0;
@@ -7917,9 +10498,12 @@ fn respawn_player(
     player.has_dropped_death_items = false;
     player.spawn_invuln_timer = 2.0;
     player.suffocation_timer = 0.0;
+    player.wither_timer = 0.0;
+    player.wither_tick_accum = 0.0;
     player.death_cause.clear();
     {
         let mut ps = player_state.write();
+        ps.dimension = DimensionId::Overworld;
         ps.pos = player.pos;
         ps.hp = ps.hp_max.max(20);
         ps.hunger = 20;
@@ -7930,7 +10514,10 @@ fn respawn_player(
         ps.has_dropped_death_items = false;
         ps.spawn_invuln_timer = 2.0;
         ps.last_death_cause.clear();
-        ps.meta.write().fields.insert("mcl_health".into(), "20".into());
+        let mut mg = ps.meta.write();
+        mg.fields.insert("mcl_health".into(), "20".into());
+        mg.fields.insert("mcl_hunger:hunger".into(), "20".into());
+        mg.fields.insert("mcl_hunger:saturation".into(), "5.00".into());
     }
     if let Some(rt) = lua_rt {
         rt.notify_player_respawned(player_state);
@@ -7964,6 +10551,14 @@ fn step_player_physics_and_respawn(
         ps.hunger = player.hunger;
         ps.wield_index = player.selected_slot + 1;
         ps.sneak = player.is_sneaking;
+        {
+            let mut mg = ps.meta.write();
+            mg.fields.insert("mcl_hunger:hunger".into(), player.hunger.to_string());
+            mg.fields.insert(
+                "mcl_hunger:saturation".into(),
+                format!("{:.2}", player.saturation),
+            );
+        }
         if player.hp < prev_hp {
             ps.hurt_flash = 0.25;
         }
@@ -7977,6 +10572,9 @@ fn step_player_physics_and_respawn(
         if let Some(spec) = reg.get_node_def(fe.node_id).and_then(|d| d.sounds.fall.as_ref()) {
             audio.play_node_sound(spec, SoundCategory::Blocks, &settings.audio);
         }
+    }
+    if step_ev.wither_damaged {
+        let _ = audio.play_named("player_damage", 0.75, 0.9, SoundCategory::Hostile, &settings.audio);
     }
     handle_player_death_if_needed(
         player,
@@ -8077,7 +10675,34 @@ fn render_nametags_in_viewport(
     }
 }
 
-/// Raycast up to 4 blocks against active entities, co-op peers, and remote LAN players before block digging.
+fn collect_mob_player_inputs(engine: &CubexEngine) -> Vec<MobPlayerInput> {
+    let mut out = Vec::with_capacity(4);
+    out.push(MobPlayerInput {
+        slot: 0,
+        dimension: engine.player.dimension,
+        pos: engine.player.pos,
+        eye_pos: engine.player.eye_pos(),
+        alive: !engine.player.is_dead,
+        survival: engine.player.gamemode == GameMode::Survival,
+    });
+    if engine.settings.coop_mode.is_active() {
+        for (idx, p) in engine.peers.iter().enumerate() {
+            if p.joined {
+                out.push(MobPlayerInput {
+                    slot: idx + 1,
+                    dimension: p.player.dimension,
+                    pos: p.player.pos,
+                    eye_pos: p.player.eye_pos(),
+                    alive: !p.player.is_dead,
+                    survival: p.player.gamemode == GameMode::Survival,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Raycast up to 4 blocks against active entities, native mobs, co-op peers, and remote LAN players before block digging.
 #[allow(clippy::too_many_arguments)]
 fn try_melee_entity_attack(
     player_slot: usize,
@@ -8090,6 +10715,7 @@ fn try_melee_entity_attack(
     player_state: &Arc<RwLock<ObjectState>>,
     peer_players: &[Arc<RwLock<ObjectState>>],
     remote_players: &mut HashMap<String, RemoteLanPlayer>,
+    mob_manager: &mut MobManager,
     registries: &Arc<RwLock<EngineRegistries>>,
     lua_rt: Option<&LuaRuntime>,
     audio: &AudioEngine,
@@ -8109,6 +10735,92 @@ fn try_melee_entity_attack(
         return false;
     }
 
+    let held_item_name = {
+        let ps = player_state.read();
+        let widx = ps.wield_index.saturating_sub(1);
+        let mg = ps.meta.read();
+        mg.inventories
+            .get("main")
+            .and_then(|v| v.get(widx))
+            .map(|s| s.name.clone())
+            .unwrap_or_default()
+    };
+    let held_dmg = {
+        let reg = registries.read();
+        reg.get_item_def(&held_item_name)
+            .and_then(|d| d.tool_capabilities.as_ref())
+            .and_then(|tc| tc.damage_groups.get("fleshy").copied())
+            .unwrap_or(2)
+            .max(2)
+    };
+
+    if mob_manager.has_melee_target(eye, dir, max_dist, player.dimension) {
+        if mine_just || (mine_held && *attack_tflp >= 0.45) {
+            *attack_tflp = 0.0;
+            if let Some(ref mut r) = renderer {
+                if player_slot == 0 {
+                    r.viewmodel.trigger_swing();
+                } else if let Some(pslot) = r.peer_slot_mut(player_slot) {
+                    pslot.viewmodel.trigger_swing();
+                }
+            }
+            if let Some(res) = mob_manager.try_melee_hit(
+                eye,
+                dir,
+                max_dist,
+                player.dimension,
+                player_slot,
+                held_dmg,
+            ) {
+                match res {
+                    MeleeNativeResult::DeflectedFireball(fpos) => {
+                        let _ = audio.play_named(
+                            "mobs_fireball",
+                            0.85,
+                            1.15,
+                            SoundCategory::Hostile,
+                            &settings.audio,
+                        );
+                        if let Some(ref mut r) = renderer {
+                            let psys = r.particles_for_mut(player.dimension);
+                            for _ in 0..8 {
+                                psys.spawn_torch_ember(fpos);
+                            }
+                        }
+                    }
+                    MeleeNativeResult::HitMob {
+                        pos,
+                        killed,
+                        drops,
+                        sound,
+                        ..
+                    } => {
+                        let _ = audio.play_named(
+                            sound,
+                            0.85,
+                            1.0,
+                            SoundCategory::Hostile,
+                            &settings.audio,
+                        );
+                        if let Some(ref mut r) = renderer {
+                            let psys = r.particles_for_mut(player.dimension);
+                            for _ in 0..(if killed { 12 } else { 5 }) {
+                                psys.spawn_nether_ash(pos + Vec3::Y);
+                            }
+                        }
+                        if !drops.is_empty() {
+                            let reg = registries.read();
+                            if add_drops_to_inventory(player_state, &drops, &reg) {
+                                audio.play_pickup(&settings.audio);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     enum MeleeTarget {
         Entity(u64),
         Peer(Arc<RwLock<ObjectState>>),
@@ -8119,13 +10831,18 @@ fn try_melee_entity_attack(
     let mut chosen = None;
 
     if let Some(rt) = lua_rt {
-        let entities = rt.active_entities();
-        if let Some(eh) = raycast_entities(eye, dir, max_dist, &entities) {
-            best_dsq = eh.distance_sq;
-            chosen = Some(MeleeTarget::Entity(eh.entity_id));
+        if !player.dimension.is_nether() {
+            let entities = rt.active_entities();
+            if let Some(eh) = raycast_entities(eye, dir, max_dist, &entities) {
+                best_dsq = eh.distance_sq;
+                chosen = Some(MeleeTarget::Entity(eh.entity_id));
+            }
         }
     }
     for peer in peer_players {
+        if peer.read().dimension != player.dimension {
+            continue;
+        }
         if let Some(ph) = raycast_player(eye, dir, max_dist, peer) {
             if ph.distance_sq < best_dsq {
                 best_dsq = ph.distance_sq;
@@ -8133,11 +10850,13 @@ fn try_melee_entity_attack(
             }
         }
     }
-    for (rname, rp) in remote_players.iter() {
-        if let Some(dsq) = raycast_player_aabb(eye, dir, max_dist, rp.pos) {
-            if dsq < best_dsq {
-                best_dsq = dsq;
-                chosen = Some(MeleeTarget::Remote(rname.clone()));
+    if !player.dimension.is_nether() {
+        for (rname, rp) in remote_players.iter() {
+            if let Some(dsq) = raycast_player_aabb(eye, dir, max_dist, rp.pos) {
+                if dsq < best_dsq {
+                    best_dsq = dsq;
+                    chosen = Some(MeleeTarget::Remote(rname.clone()));
+                }
             }
         }
     }
@@ -8254,11 +10973,12 @@ fn run_player_block_actions(
     net_session: Option<&NetClientSession>,
     local_server: Option<&LocalServerHandle>,
     mut renderer: Option<&mut WgpuRenderer>,
-) {
+) -> Option<IVec3> {
     if player.is_dead {
         digger.reset();
-        return;
+        return None;
     }
+    let mut opened_chest_pos: Option<IVec3> = None;
     let reg = registries.read();
     let sel_boxes = targeted
         .map(|h| selected_world_boxes(h, &reg))
@@ -8297,7 +11017,7 @@ fn run_player_block_actions(
         if dig_res.spawn_dig_particles && settings.block_shatter_physics {
             if let Some(hit) = targeted {
                 let (_, p1, _) = world.get_node(hit.under);
-                r.particles.spawn_dig_chips(
+                r.particles_for_mut(world.dimension).spawn_dig_chips(
                     hit.under,
                     hit.node_id,
                     4,
@@ -8314,6 +11034,7 @@ fn run_player_block_actions(
     }
     if let Some(ref comp) = dig_res.completed_dig {
         player.add_exhaustion(0.05);
+        let _ = extinguish_portal_around(world, &reg, comp.pos);
         if let Some(ref s) = comp.sound_dug {
             audio.play_node_sound(s, SoundCategory::Blocks, &settings.audio);
         }
@@ -8323,7 +11044,7 @@ fn run_player_block_actions(
         if let Some(ref mut r) = renderer {
             if settings.block_shatter_physics {
                 let (_, p1, _) = world.get_node(comp.pos);
-                r.particles.spawn_shatter_debris(
+                r.particles_for_mut(world.dimension).spawn_shatter_debris(
                     comp.pos,
                     comp.node_id,
                     atlas,
@@ -8334,18 +11055,20 @@ fn run_player_block_actions(
             }
             r.relight_and_remesh_at(world, comp.pos, &reg, atlas, settings.smooth_lighting);
         }
-        if let Some(session) = net_session {
-            session.send(NetPacket::BlockEdit {
-                x: comp.pos.x,
-                y: comp.pos.y,
-                z: comp.pos.z,
-                node_name: "air".into(),
-                param1: 15,
-                param2: 0,
-            });
-        }
-        if let Some(srv) = local_server {
-            srv.record_host_block_edit(comp.pos, "air".into(), 15, 0);
+        if !world.dimension.is_nether() {
+            if let Some(session) = net_session {
+                session.send(NetPacket::BlockEdit {
+                    x: comp.pos.x,
+                    y: comp.pos.y,
+                    z: comp.pos.z,
+                    node_name: "air".into(),
+                    param1: 15,
+                    param2: 0,
+                });
+            }
+            if let Some(srv) = local_server {
+                srv.record_host_block_edit(comp.pos, "air".into(), 15, 0);
+            }
         }
     }
 
@@ -8362,11 +11085,14 @@ fn run_player_block_actions(
                 }
             }
             *last_inv_total_count = total_inventory_items(player_state);
-            return;
+            return None;
         }
         if let Some(hit) = targeted {
             *last_interact_pos = Some(hit.under);
             let pr = try_interact_or_place(hit, world, &reg, player, player_state, lua_rt);
+            if pr.open_chest_pos.is_some() {
+                opened_chest_pos = pr.open_chest_pos;
+            }
             if pr.placed || pr.interacted {
                 if let Some(ref mut r) = renderer {
                     if player_slot == 0 {
@@ -8379,27 +11105,62 @@ fn run_player_block_actions(
             if let Some(ref s) = pr.sound_place {
                 audio.play_node_sound(s, SoundCategory::Blocks, &settings.audio);
             }
+            if let Some(origin) = pr.portal_ignited {
+                if let Some(ref mut r) = renderer {
+                    for off in 0..10 {
+                        let c = origin.as_vec3() + Vec3::new(0.5 + (off % 2) as f32 * 0.4, 0.5 + (off % 3) as f32 * 0.6, 0.5);
+                        r.particles_for_mut(world.dimension).spawn_portal_spark(c);
+                    }
+                    r.relight_and_remesh_at(world, origin, &reg, atlas, settings.smooth_lighting);
+                }
+            }
+            if let Some(epos) = pr.water_evaporated_pos {
+                if let Some(ref mut r) = renderer {
+                    r.particles_for_mut(world.dimension).spawn_steam_burst(epos, 16);
+                }
+            }
+            if let Some(bpos) = pr.bed_exploded_pos {
+                if let Some(ref mut r) = renderer {
+                    r.particles_for_mut(world.dimension)
+                        .spawn_explosion_burst(bpos.as_vec3() + Vec3::splat(0.5), 32);
+                    r.relight_and_remesh_at(world, bpos, &reg, atlas, settings.smooth_lighting);
+                }
+                if player.gamemode != GameMode::Creative && player.spawn_invuln_timer <= 0.0 {
+                    player.hp = (player.hp - 14).max(0);
+                    player.vel.y = 7.5;
+                    let mut ps = player_state.write();
+                    ps.hp = player.hp;
+                    ps.hurt_flash = 0.25;
+                    if player.hp == 0 && player.death_cause.is_empty() {
+                        player.death_cause = "Killed by [Intentional Game Design]".into();
+                        ps.last_death_cause = player.death_cause.clone();
+                    }
+                }
+            }
             if let Some(ppos) = pr.placed_pos {
                 if let Some(ref mut r) = renderer {
                     r.relight_and_remesh_at(world, ppos, &reg, atlas, settings.smooth_lighting);
                 }
-                let (nid, np1, np2) = world.get_node(ppos);
-                let nname = reg.get_name_from_content_id(nid).to_string();
-                if let Some(session) = net_session {
-                    session.send(NetPacket::BlockEdit {
-                        x: ppos.x,
-                        y: ppos.y,
-                        z: ppos.z,
-                        node_name: nname.clone(),
-                        param1: np1,
-                        param2: np2,
-                    });
-                }
-                if let Some(srv) = local_server {
-                    srv.record_host_block_edit(ppos, nname, np1, np2);
+                if !world.dimension.is_nether() {
+                    let (nid, np1, np2) = world.get_node(ppos);
+                    let nname = reg.get_name_from_content_id(nid).to_string();
+                    if let Some(session) = net_session {
+                        session.send(NetPacket::BlockEdit {
+                            x: ppos.x,
+                            y: ppos.y,
+                            z: ppos.z,
+                            node_name: nname.clone(),
+                            param1: np1,
+                            param2: np2,
+                        });
+                    }
+                    if let Some(srv) = local_server {
+                        srv.record_host_block_edit(ppos, nname, np1, np2);
+                    }
                 }
             }
         }
     }
     *last_inv_total_count = total_inventory_items(player_state);
+    opened_chest_pos
 }

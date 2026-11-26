@@ -48,7 +48,7 @@ struct VertexOut {
     @location(6) @interpolate(flat) waving: u32,
     @location(7) @interpolate(flat) hurt_flash: u32,
     @location(8) @interpolate(flat) no_alpha_discard: u32,
-    @location(9) @interpolate(flat) mat_flags: u32, // bit 0=specular, bit 1=emissive
+    @location(9) @interpolate(flat) mat_flags: u32, // bit 0=specular, bit 1=emissive, bit 2=portal
     @location(10) @interpolate(flat) face_dir: u32,
 }
 
@@ -65,6 +65,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     let no_alpha_discard = (in.packed >> 27u) & 0x1u;
     let is_specular = (in.packed >> 28u) & 0x1u;
     let is_emissive = (in.packed >> 29u) & 0x1u;
+    let is_portal = (in.packed >> 30u) & 0x1u;
 
     var wpos = in.pos;
     if (waving == 1u) {
@@ -100,7 +101,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     out.waving = waving;
     out.hurt_flash = hurt_flash;
     out.no_alpha_discard = no_alpha_discard;
-    out.mat_flags = is_specular | (is_emissive << 1u);
+    out.mat_flags = is_specular | (is_emissive << 1u) | (is_portal << 2u);
     out.face_dir = face_dir;
     return out;
 }
@@ -150,21 +151,35 @@ fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
 }
 
 fn sample_voxel_texel(in: VertexOut) -> vec4<f32> {
-    var sample_uv = in.uv;
-    if (in.waving == 1u && in.cutout == 0u && cam.flags.z > 0.5) {
+    var base_uv = in.uv;
+    if ((in.mat_flags & 4u) != 0u) {
         let t = cam.sun_dir_time.w;
-        sample_uv = sample_uv + vec2<f32>(sin(t * 1.1 + in.world_pos.z * 0.6) * 0.02, t * 0.07);
+        base_uv = base_uv + vec2<f32>(sin(t * 1.4 + in.uv.y * 3.14159) * 0.08, -t * 0.42);
+    } else if (in.waving == 1u && in.cutout == 0u && cam.flags.z > 0.5) {
+        let t = cam.sun_dir_time.w;
+        base_uv = base_uv + vec2<f32>(sin(t * 1.1 + in.world_pos.z * 0.6) * 0.02, t * 0.07);
     }
-    let uv_dx = dpdx(sample_uv);
-    let uv_dy = dpdy(sample_uv);
-    if (in.no_alpha_discard == 0u) {
-        let tex_dim = textureDimensions(tex_array);
-        if (tex_dim.x == 32u && tex_dim.y == 32u) {
+    let uv_dx = dpdx(base_uv);
+    let uv_dy = dpdy(base_uv);
+    let tex_dim = vec2<f32>(textureDimensions(tex_array));
+    var sample_uv = base_uv;
+    var dx = uv_dx;
+    var dy = uv_dy;
+    if (tex_dim.x == 32.0 && tex_dim.y == 32.0) {
+        let tile_uv = fract(base_uv);
+        let foot = max(length(uv_dx * tex_dim), length(uv_dy * tex_dim));
+        if ((in.mat_flags & 4u) == 0u && foot < 0.98) {
+            sample_uv = (floor(clamp(tile_uv, vec2<f32>(0.0), vec2<f32>(0.9999)) * tex_dim) + vec2<f32>(0.5)) / tex_dim;
+            dx = vec2<f32>(0.0);
+            dy = vec2<f32>(0.0);
+        } else if (in.no_alpha_discard == 0u) {
             let half_tex = 0.5 / 32.0;
-            sample_uv = clamp(fract(sample_uv), vec2<f32>(half_tex), vec2<f32>(1.0 - half_tex));
+            sample_uv = clamp(tile_uv, vec2<f32>(half_tex), vec2<f32>(1.0 - half_tex));
+        } else {
+            sample_uv = tile_uv;
         }
     }
-    return textureSampleGrad(tex_array, tex_sampler, sample_uv, i32(in.layer), uv_dx, uv_dy);
+    return textureSampleGrad(tex_array, tex_sampler, sample_uv, i32(in.layer), dx, dy);
 }
 
 fn water_sky_reflection(
@@ -255,6 +270,62 @@ fn shade_voxel(in: VertexOut, texel: vec4<f32>) -> vec4<f32> {
     let hand_warm_color = vec3<f32>(1.0, 0.62, 0.267); // #FF9E44 warm orange-gold torch light
     var rgb: vec3<f32>;
     var out_alpha = texel.a * in.tint.a;
+    let is_nether = cam.camera_pos.w > 0.5;
+    let is_portal = (in.mat_flags & 4u) != 0u;
+
+    if (is_portal) {
+        let wave1 = sin(in.world_pos.y * 5.0 - t * 3.8 + sin(in.world_pos.x * 3.2 + in.world_pos.z * 3.2)) * 0.5 + 0.5;
+        let wave2 = cos((in.world_pos.x + in.world_pos.z) * 4.5 + t * 2.9) * 0.5 + 0.5;
+        let portal_glow = mix(vec3<f32>(0.42, 0.08, 0.72), vec3<f32>(0.88, 0.36, 1.0), wave1 * 0.65 + wave2 * 0.35);
+        let boost = select(0.55, 1.05, cam.enhance_flags.z > 0.5);
+        rgb = texel.rgb * vec3<f32>(0.92, 0.58, 1.15) * (0.90 + boost * 0.45) + portal_glow * (0.45 + boost * 0.35);
+        out_alpha = clamp(0.76 + 0.14 * wave1, 0.72, 0.90);
+
+        let fog_end = cam.fog_color_dist.w;
+        if (fog_end < 4000.0) {
+            let dist = distance(in.world_pos, cam.camera_pos.xyz);
+            let eff_end = max(32.0, fog_end);
+            let fog_start = eff_end * select(0.65, 0.32, is_nether);
+            let fog_t = smoothstep(fog_start, eff_end, dist);
+            rgb = mix(rgb, cam.fog_color_dist.rgb, fog_t);
+        }
+        if (cam.enhance_flags.x > 0.5 && cam.enhance_flags.z < 0.5) {
+            rgb = aces_filmic(rgb);
+        }
+        return vec4<f32>(rgb, out_alpha);
+    }
+
+    if (is_nether) {
+        let n = face_normal_from_dir(in.face_dir);
+        let nether_ambient = vec3<f32>(0.26, 0.085, 0.068);
+        let lava_bounce = clamp(-n.y * 0.5 + 0.5, 0.0, 1.0) * vec3<f32>(0.24, 0.072, 0.024);
+        let ambient_floor = base_albedo * (nether_ambient + lava_bounce) * (dir_shade * ao);
+        let block_warm = mix(vec3<f32>(1.0, 0.72, 0.44), hand_warm_color, clamp(block_lit * 1.15, 0.0, 1.0));
+        let block_contrib = base_albedo * block_warm * (block_lit * dir_shade * ao * 1.18);
+        let hand_contrib = base_albedo * hand_warm_color * (hand_light * 1.32 * (0.65 + 0.35 * dir_shade));
+
+        rgb = (max(ambient_floor + hand_contrib, ambient_floor * 0.55 + block_contrib + hand_contrib * 0.72)) * cam.flags.w;
+        if ((in.mat_flags & 2u) != 0u) {
+            let bloom_boost = select(0.54, 1.05, cam.enhance_flags.z > 0.5);
+            rgb += texel.rgb * vec3<f32>(1.24, 0.78, 0.40) * bloom_boost;
+        }
+        if (in.hurt_flash == 1u) {
+            let flash_red = vec3<f32>(0.96, 0.14, 0.14) * max(0.55, dir_shade * max(0.35, block_lit));
+            rgb = mix(rgb, flash_red, 0.62);
+        }
+        let fog_end = cam.fog_color_dist.w;
+        if (fog_end < 4000.0) {
+            let dist = distance(in.world_pos, cam.camera_pos.xyz);
+            let eff_end = max(32.0, fog_end);
+            let fog_start = eff_end * 0.32;
+            let fog_t = smoothstep(fog_start, eff_end, dist);
+            rgb = mix(rgb, cam.fog_color_dist.rgb, fog_t);
+        }
+        if (cam.enhance_flags.x > 0.5 && cam.enhance_flags.z < 0.5) {
+            rgb = aces_filmic(rgb);
+        }
+        return vec4<f32>(rgb, out_alpha);
+    }
 
     if (cam.enhance_flags.x > 0.5) {
         // Enhanced shading: directional sun shadow map, warm key light, cool shadow bounce, ACES
@@ -355,8 +426,15 @@ fn shade_voxel(in: VertexOut, texel: vec4<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let texel = sample_voxel_texel(in);
-    if (in.no_alpha_discard == 0u && texel.a < 0.5) {
-        discard;
+    if (in.no_alpha_discard == 0u) {
+        var cutoff = 0.5;
+        if (in.cutout == 1u) {
+            let dist = distance(in.world_pos, cam.camera_pos.xyz);
+            cutoff = mix(0.50, 0.35, smoothstep(18.0, 56.0, dist));
+        }
+        if (texel.a < cutoff) {
+            discard;
+        }
     }
     return shade_voxel(in, texel);
 }

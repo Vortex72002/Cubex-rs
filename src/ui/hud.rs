@@ -10,7 +10,7 @@ use crate::registry::EngineRegistries;
 use crate::textures::TextureAtlas;
 use crate::ui::theme::{mc_shadow_text, paint_item_in_slot, ItemIconCache};
 pub use crate::ui::theme::{strip_luanti_escapes, HudIconTextures};
-use crate::world::WorldStore;
+use crate::world::{DimensionId, WorldStore};
 
 pub struct HudTelemetry<'a> {
     pub atlas: Option<&'a TextureAtlas>,
@@ -26,6 +26,10 @@ pub struct HudTelemetry<'a> {
     pub player_badge: Option<&'a str>,
     /// Remaining red screen hurt flash timer in `0.0..=0.25` seconds.
     pub hurt_flash: f32,
+    /// Active dimension (`Overworld` or `Nether`).
+    pub dimension: DimensionId,
+    /// Swirling purple Nether portal warp screen overlay opacity (`0.0..=1.0`).
+    pub portal_warp_alpha: f32,
 }
 
 impl<'a> Default for HudTelemetry<'a> {
@@ -42,6 +46,8 @@ impl<'a> Default for HudTelemetry<'a> {
             xp_progress: 0.0,
             player_badge: None,
             hurt_flash: 0.0,
+            dimension: DimensionId::Overworld,
+            portal_warp_alpha: 0.0,
         }
     }
 }
@@ -154,6 +160,18 @@ pub fn render_hud_in_rect(
             rect,
             0.0,
             Stroke::new(8.0, Color32::from_rgba_unmultiplied(230, 24, 24, edge_a)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if telemetry.portal_warp_alpha > 0.005 {
+        let p = telemetry.portal_warp_alpha.clamp(0.0, 1.0);
+        let fill_a = (132.0 * p).round() as u8;
+        let edge_a = (210.0 * p).round() as u8;
+        painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(120, 22, 185, fill_a));
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(14.0, Color32::from_rgba_unmultiplied(195, 75, 255, edge_a)),
             egui::StrokeKind::Inside,
         );
     }
@@ -337,19 +355,24 @@ pub fn render_hud_in_rect(
         };
 
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        let paint_status_icon = |r: Rect, slot: i32, bg_id, half_id, full_id| {
+        let paint_status_icon = |r: Rect, slot: i32, bg_id, half_id, full_id, tint: Color32| {
             painter.image(bg_id, r, full_uv, Color32::WHITE);
             match slot {
                 2 => {
-                    painter.image(full_id, r, full_uv, Color32::WHITE);
+                    painter.image(full_id, r, full_uv, tint);
                 }
                 1 => {
-                    painter.image(half_id, r, full_uv, Color32::WHITE);
+                    painter.image(half_id, r, full_uv, tint);
                 }
                 _ => {}
             }
         };
 
+        let heart_tint = if player.wither_timer > 0.0 {
+            Color32::from_rgb(76, 54, 82)
+        } else {
+            Color32::WHITE
+        };
         for i in 0..10 {
             let hx = (bar_x + i as f32 * icon_step).round();
             let r = Rect::from_min_size(Pos2::new(hx, heart_y), Vec2::splat(icon_sz));
@@ -360,6 +383,22 @@ pub fn render_hud_in_rect(
                 hud_tex.heart_bg.id(),
                 hud_tex.heart_half.id(),
                 hud_tex.heart_full.id(),
+                heart_tint,
+            );
+        }
+        if player.wither_timer > 0.0 {
+            let badge_r = Rect::from_min_size(
+                Pos2::new(bar_x, heart_y - 18.0),
+                Vec2::new(98.0, 15.0),
+            );
+            painter.rect_filled(badge_r, 2.0, Color32::from_rgba_unmultiplied(28, 16, 36, 190));
+            mc_shadow_text(
+                &painter,
+                badge_r.center(),
+                Align2::CENTER_CENTER,
+                &format!("Wither {:.1}s", player.wither_timer),
+                11.0,
+                Color32::from_rgb(205, 165, 225),
             );
         }
 
@@ -374,6 +413,7 @@ pub fn render_hud_in_rect(
                     hud_tex.armor_bg.id(),
                     hud_tex.armor_half.id(),
                     hud_tex.armor_full.id(),
+                    Color32::WHITE,
                 );
             }
         }
@@ -388,6 +428,7 @@ pub fn render_hud_in_rect(
                 hud_tex.hunger_bg.id(),
                 hud_tex.hunger_half.id(),
                 hud_tex.hunger_full.id(),
+                Color32::WHITE,
             );
         }
     }
@@ -470,7 +511,13 @@ pub fn render_hud_in_rect(
             format!("{:.0} fps ({:.2} ms) • Render Dist: {} chunks • Graphics: {}", fps, frame_ms, settings.render_distance_chunks, settings.graphics.as_str()),
             format!("XYZ: {:.3} / {:.3} / {:.3}  (Yaw {:.1} Pitch {:.1})", player.pos.x, player.pos.y, player.pos.z, yaw_norm, pitch_norm),
             format!("Chunk: {} {} {}  •  Facing: {}", cx, cy, cz, player.facing_label()),
-            format!("Biome: {}  •  Gamemode: {}  •  Difficulty: {}", biome_lbl, player.gamemode.label(), settings.difficulty.label()),
+            format!(
+                "Dimension: {}  •  Biome: {}  •  Gamemode: {}  •  Difficulty: {}",
+                telemetry.dimension.label(),
+                biome_lbl,
+                player.gamemode.label(),
+                settings.difficulty.label()
+            ),
             format!("Chunks Loaded: {}  Visible: {}  Culled: {}  Draw Calls: {}", chunks_loaded, visible_chunks, culled_chunks, draw_calls),
             target_line,
             format!("GPU: {}", gpu_name),

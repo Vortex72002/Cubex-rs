@@ -41,6 +41,7 @@ pub struct VoxelVertex {
 impl VoxelVertex {
     pub const FLAG_SPECULAR: u32 = 1u32 << 28;
     pub const FLAG_EMISSIVE: u32 = 1u32 << 29;
+    pub const FLAG_PORTAL: u32 = 1u32 << 30;
 
     pub const ATTRS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
         0 => Float32x3,
@@ -114,6 +115,9 @@ fn node_material_extra_bits(def: &NodeDef) -> u32 {
         || lower.contains("emeraldblock")
     {
         bits |= VoxelVertex::FLAG_SPECULAR;
+    }
+    if def.name == crate::registry::NETHER_PORTAL_NODE_ID || lower.contains("nether_portal") {
+        bits |= VoxelVertex::FLAG_PORTAL | VoxelVertex::FLAG_EMISSIVE;
     }
     if def.light_source >= 8
         || is_lava

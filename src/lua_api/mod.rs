@@ -104,7 +104,7 @@ impl LuaIncrementalBoot {
             self.errors,
         );
         let abm_by_node_id = LuaRuntime::build_abm_index(&self.lua, &self.shared.registries);
-        LuaRuntime::install_cubex_lua_hooks(&self.lua);
+        LuaRuntime::install_cubex_lua_hooks(&self.lua, &self.shared.registries);
         LuaRuntime {
             lua: self.lua,
             shared: self.shared,
@@ -134,10 +134,51 @@ pub struct LuaRuntime {
 }
 
 impl LuaRuntime {
-    fn install_cubex_lua_hooks(lua: &Lua) {
+    fn install_cubex_lua_hooks(lua: &Lua, registries: &Arc<RwLock<EngineRegistries>>) {
+        registries.write().register_cubex_builtin_items();
         let _ = lua
             .load(
                 r#"
+                if type(core) == "table" and type(core.registered_items) == "table" then
+                    if not core.registered_items["cubex:ram_mic"] then
+                        local def = {
+                            name = "cubex:ram_mic",
+                            type = "craft",
+                            description = "RAM Stick Mic",
+                            inventory_image = "cubex_ram_mic.png",
+                            wield_image = "cubex_ram_mic.png",
+                            stack_max = 1,
+                            groups = { cubex_prop = 1 },
+                        }
+                        core.registered_items["cubex:ram_mic"] = def
+                        if type(core.registered_craftitems) == "table" then
+                            core.registered_craftitems["cubex:ram_mic"] = def
+                        end
+                    end
+                    if not core.registered_items["cubex:nether_portal"] then
+                        local pdef = {
+                            name = "cubex:nether_portal",
+                            type = "node",
+                            description = "Nether Portal",
+                            drawtype = "nodebox",
+                            paramtype = "light",
+                            paramtype2 = "facedir",
+                            walkable = false,
+                            pointable = true,
+                            diggable = true,
+                            sunlight_propagates = true,
+                            light_source = 11,
+                            use_texture_alpha = "blend",
+                            tiles = { "cubex_nether_portal.png" },
+                            drop = "",
+                            groups = { dig_immediate = 3, portal = 1 },
+                        }
+                        core.registered_items["cubex:nether_portal"] = pdef
+                        if type(core.registered_nodes) == "table" then
+                            core.registered_nodes["cubex:nether_portal"] = pdef
+                        end
+                    end
+                end
                 if type(mcl_mobs) == "table" then
                     function mcl_mobs.is_position_completely_generated(pos)
                         if type(pos) ~= "table" then return true end
@@ -169,7 +210,7 @@ impl LuaRuntime {
 
         let load_report = load_all_mods(&lua, &shared).map_err(|e| anyhow!("{e}"))?;
         let abm_by_node_id = Self::build_abm_index(&lua, &shared.registries);
-        Self::install_cubex_lua_hooks(&lua);
+        Self::install_cubex_lua_hooks(&lua, &shared.registries);
         Ok(Self {
             lua,
             shared,
@@ -587,6 +628,33 @@ impl LuaRuntime {
         st.accel = Vec3::new(0.0, -9.81, 0.0);
         st.accel_set_by_lua = true;
         st.physical = true;
+        st.collisionbox = [-0.18, -0.18, -0.18, 0.18, 0.18, 0.18];
+        st.selectionbox = [-0.18, -0.18, -0.18, 0.18, 0.18, 0.18];
+        st.visual = "wielditem".into();
+        st.wield_item = spec.to_string();
+        st.automatic_rotate = 1.8;
+        self.shared.entities.write().insert(eid, Arc::new(RwLock::new(st)));
+        true
+    }
+
+    /// Spawn a player-thrown physical `__builtin:item` entity with an initial pickup delay.
+    pub fn spawn_thrown_item_drop(&self, pos: Vec3, vel: Vec3, item_spec: &str) -> bool {
+        let spec = item_spec.trim();
+        if spec.is_empty() {
+            return false;
+        }
+        let eid = {
+            let mut next = self.shared.next_entity_id.write();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        let mut st = ObjectState::new_entity(eid, "__builtin:item", pos);
+        st.vel = vel;
+        st.accel = Vec3::new(0.0, -9.81, 0.0);
+        st.accel_set_by_lua = true;
+        st.physical = true;
+        st.age_sec = -0.9;
         st.collisionbox = [-0.18, -0.18, -0.18, 0.18, 0.18, 0.18];
         st.selectionbox = [-0.18, -0.18, -0.18, 0.18, 0.18, 0.18];
         st.visual = "wielditem".into();

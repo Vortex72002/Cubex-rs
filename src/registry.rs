@@ -3,6 +3,43 @@ use std::collections::HashMap;
 pub const CONTENT_UNKNOWN: u16 = 125;
 pub const CONTENT_AIR: u16 = 126;
 pub const CONTENT_IGNORE: u16 = 127;
+pub const RAM_MIC_ITEM_ID: &str = "cubex:ram_mic";
+pub const NETHER_PORTAL_NODE_ID: &str = "cubex:nether_portal";
+
+/// Returns `true` for standard terrain nodes (`dirt`, `grass`, `snow`, `sand`, `stone`, `wood`,
+/// `leaves`, `water`, etc.) so they never inadvertently deal `damage_per_second` contact damage.
+pub fn is_safe_terrain_node(name: &str, groups: &HashMap<String, i32>) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const HAZARD_KEYWORDS: &[&str] = &[
+        "lava",
+        "fire",
+        "campfire",
+        "magma",
+        "cactus",
+        "sweet_berry",
+        "wither_rose",
+        "acid",
+        "spike",
+        "poison",
+        "powder_snow",
+    ];
+    if HAZARD_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return false;
+    }
+    const SAFE_KEYWORDS: &[&str] = &[
+        "dirt", "grass", "snow", "sand", "stone", "cobble", "wood", "tree", "plank", "leaves",
+        "water", "gravel", "clay", "ice",
+    ];
+    if SAFE_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+    ["soil", "sand", "stone", "wood", "tree", "leaves", "water"]
+        .iter()
+        .any(|g| groups.get(*g).copied().unwrap_or(0) > 0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawType {
@@ -727,7 +764,58 @@ impl EngineRegistries {
                 ..Default::default()
             },
         );
+        reg.register_cubex_builtin_items();
         reg
+    }
+
+    pub fn register_cubex_builtin_items(&mut self) {
+        if !self.items.contains_key(RAM_MIC_ITEM_ID) {
+            self.register_item(ItemDef {
+                name: RAM_MIC_ITEM_ID.into(),
+                item_type: "craft".into(),
+                description: "RAM Stick Mic".into(),
+                inventory_image: "cubex_ram_mic.png".into(),
+                wield_image: "cubex_ram_mic.png".into(),
+                stack_max: 1,
+                groups: HashMap::from([("cubex_prop".into(), 1)]),
+                is_node: false,
+                ..Default::default()
+            });
+        }
+        if !self.name_to_id.contains_key(NETHER_PORTAL_NODE_ID) {
+            self.register_node(NodeDef {
+                name: NETHER_PORTAL_NODE_ID.into(),
+                description: "Nether Portal".into(),
+                drawtype: DrawType::NodeBox,
+                walkable: false,
+                pointable: true,
+                diggable: true,
+                climbable: false,
+                buildable_to: false,
+                sunlight_propagates: true,
+                light_source: 11,
+                paramtype: "light".into(),
+                paramtype2: "facedir".into(),
+                is_ground_content: false,
+                use_texture_alpha: "blend".into(),
+                tiles: vec![TileSpec {
+                    name: "cubex_nether_portal.png".into(),
+                    color: None,
+                }],
+                node_box_type: "fixed".into(),
+                node_boxes: vec![[-0.5, -0.5, -0.125, 0.5, 0.5, 0.125]],
+                selection_boxes: vec![[-0.5, -0.5, -0.125, 0.5, 0.5, 0.125]],
+                collision_boxes: Vec::new(),
+                groups: HashMap::from([("dig_immediate".into(), 3), ("portal".into(), 1)]),
+                drop: NodeDrop::Empty,
+                floodable: false,
+                waving: 0,
+                inventory_image: "cubex_nether_portal.png".into(),
+                wield_image: "cubex_nether_portal.png".into(),
+                stack_max: 64,
+                ..Default::default()
+            });
+        }
     }
 
     fn insert_fixed_node(&mut self, id: u16, def: NodeDef) {
@@ -749,6 +837,9 @@ impl EngineRegistries {
     }
 
     pub fn register_node(&mut self, mut def: NodeDef) -> u16 {
+        if is_safe_terrain_node(&def.name, &def.groups) {
+            def.damage_per_second = 0;
+        }
         if let Some(&existing) = self.name_to_id.get(&def.name) {
             def.id = existing;
             self.nodes_by_id[existing as usize] = Some(def);

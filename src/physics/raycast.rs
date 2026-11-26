@@ -10,7 +10,9 @@ use crate::registry::{
     compute_dig_params_with_wear, DrawType, EngineRegistries, NodeDef, SoundSpec,
     ToolCapabilities, CONTENT_AIR, CONTENT_IGNORE, CONTENT_UNKNOWN,
 };
-use crate::world::WorldStore;
+use crate::world::light::relight_around_pos;
+use crate::world::portal::{extinguish_portal_around, is_obsidian, is_portal_igniter, try_ignite_portal};
+use crate::world::{DimensionId, WorldStore};
 
 use super::collision::{
     compute_connected_neighbors, is_liquid_node, world_collision_boxes,
@@ -1141,6 +1143,133 @@ pub struct PlaceResult {
     pub placed: bool,
     pub placed_pos: Option<IVec3>,
     pub sound_place: Option<SoundSpec>,
+    pub portal_ignited: Option<IVec3>,
+    pub water_evaporated_pos: Option<IVec3>,
+    pub bed_exploded_pos: Option<IVec3>,
+    pub open_chest_pos: Option<IVec3>,
+}
+
+/// Returns `true` when `item_name` is an empty bucket item (`mcl_buckets:bucket_empty`).
+pub fn is_empty_bucket_item(item_name: &str) -> bool {
+    let lower = item_name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "mcl_buckets:bucket_empty" | "bucket:bucket_empty"
+    )
+}
+
+/// Returns `true` when `player`'s currently selected hotbar slot holds an empty bucket.
+pub fn held_item_is_empty_bucket(
+    player: &PlayerController,
+    player_state: &Arc<RwLock<ObjectState>>,
+) -> bool {
+    let slot_idx = player.selected_slot.min(8);
+    let ps = player_state.read();
+    let mg = ps.meta.read();
+    mg.inventories
+        .get("main")
+        .and_then(|v| v.get(slot_idx))
+        .filter(|s| !s.is_empty())
+        .is_some_and(|s| is_empty_bucket_item(&s.name))
+}
+
+#[inline]
+fn is_water_source_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "mcl_core:water_source"
+            | "mcl_core:river_water_source"
+            | "default:water_source"
+            | "default:river_water_source"
+    )
+}
+
+#[inline]
+fn is_any_water_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    is_water_source_name(&lower)
+        || lower.ends_with(":water_flowing")
+        || lower.ends_with(":river_water_flowing")
+}
+
+#[inline]
+fn is_lava_source_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "mcl_core:lava_source" | "mcl_nether:nether_lava_source" | "default:lava_source"
+    )
+}
+
+/// Cools any `lava_source` at or orthogonally adjacent to `center` that touches water from above or horizontally.
+pub fn cool_lava_around(
+    world: &WorldStore,
+    registries: &EngineRegistries,
+    center: IVec3,
+) -> Vec<IVec3> {
+    let obsidian_id = registries.get_content_id("mcl_core:obsidian");
+    if obsidian_id == CONTENT_UNKNOWN {
+        return Vec::new();
+    }
+    let candidates = [
+        center,
+        center - IVec3::Y,
+        center + IVec3::X,
+        center - IVec3::X,
+        center + IVec3::Z,
+        center - IVec3::Z,
+        center + IVec3::Y,
+    ];
+    let mut cooled = Vec::new();
+    for lp in candidates {
+        if cooled.contains(&lp) {
+            continue;
+        }
+        let (nid, _, _) = world.get_node(lp);
+        if nid == CONTENT_AIR || nid == CONTENT_IGNORE {
+            continue;
+        }
+        let nname = registries.get_name_from_content_id(nid);
+        if !is_lava_source_name(nname) {
+            continue;
+        }
+        let water_touches = [
+            lp + IVec3::Y,
+            lp + IVec3::X,
+            lp - IVec3::X,
+            lp + IVec3::Z,
+            lp - IVec3::Z,
+        ]
+        .into_iter()
+        .any(|wp| {
+            let (wid, _, _) = world.get_node(wp);
+            wid != CONTENT_AIR
+                && wid != CONTENT_IGNORE
+                && is_any_water_name(registries.get_name_from_content_id(wid))
+        });
+        if water_touches {
+            world.set_node(lp, obsidian_id, 15, 0);
+            world.mark_priority_dirty_with_neighbors(lp);
+            relight_around_pos(world, lp, registries);
+            cooled.push(lp);
+        }
+    }
+    cooled
+}
+
+/// Returns `true` when `node_name` is an interactive 27-slot storage/loot chest.
+pub fn is_chest_node_name(node_name: &str) -> bool {
+    let lower = node_name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "mcl_chests:chest"
+            | "mcl_chests:chest_small"
+            | "mcl_chests:trapped_chest"
+            | "mcl_chests:trapped_chest_small"
+            | "default:chest"
+            | "default:chest_locked"
+    )
 }
 
 /// Luanti `core.dir_to_facedir` for horizontal placement (`0..3`).
@@ -1278,6 +1407,271 @@ pub fn try_interact_or_place(
     let under_buildable_to = under_def.map(|d| d.buildable_to).unwrap_or(false);
     let target_pos = if under_buildable_to { hit.under } else { hit.above };
 
+    // 1. Pre-Lua Nether Bed Explosion Intercept (Intentional Game Design!)
+    if world.dimension == DimensionId::Nether && !player.is_sneaking {
+        let lower_under = under_name.to_ascii_lowercase();
+        if lower_under.contains("mcl_beds:")
+            && (lower_under.contains("bed") || lower_under.ends_with("_bottom") || lower_under.ends_with("_top"))
+        {
+            let center = hit.under;
+            world.set_node(center, CONTENT_AIR, 0, 0);
+            world.mark_priority_dirty_with_neighbors(center);
+            for dx in -4..=4 {
+                for dy in -4..=4 {
+                    for dz in -4..=4 {
+                        if dx * dx + dy * dy + dz * dz > 16 {
+                            continue;
+                        }
+                        let p = center + IVec3::new(dx, dy, dz);
+                        if p.y <= 0 || p.y >= 127 {
+                            continue;
+                        }
+                        let (nid, _, _) = world.get_node(p);
+                        if nid == CONTENT_AIR || nid == CONTENT_IGNORE {
+                            continue;
+                        }
+                        let nname = registries.get_name_from_content_id(nid).to_ascii_lowercase();
+                        if nname.contains("bedrock") || nname.contains("obsidian") {
+                            continue;
+                        }
+                        world.set_node(p, CONTENT_AIR, 0, 0);
+                        world.mark_priority_dirty_with_neighbors(p);
+                        let _ = extinguish_portal_around(world, registries, p);
+                    }
+                }
+            }
+            relight_around_pos(world, center, registries);
+            return PlaceResult {
+                interacted: true,
+                bed_exploded_pos: Some(center),
+                ..Default::default()
+            };
+        }
+    }
+
+    // 2. Pre-Lua Nether Water Bucket Evaporation Intercept
+    if world.dimension == DimensionId::Nether {
+        if let Some(ref hname) = held_name {
+            let hl = hname.to_ascii_lowercase();
+            let is_water_item = hl.contains("bucket_water")
+                || hl.contains("bucket_river_water")
+                || hl.contains("water_bucket")
+                || hl.ends_with(":water_source")
+                || hl.ends_with(":river_water_source");
+            if is_water_item {
+                if !creative {
+                    let ps = player_state.write();
+                    let mut mg = ps.meta.write();
+                    if let Some(main) = mg.inventories.get_mut("main") {
+                        if let Some(slot) = main.get_mut(slot_idx) {
+                            if hl.contains("bucket") && registries.items.contains_key("mcl_buckets:bucket_empty") {
+                                *slot = ItemStackData::from_spec("mcl_buckets:bucket_empty 1");
+                            } else if slot.count > 1 {
+                                slot.count -= 1;
+                            } else {
+                                *slot = ItemStackData::default();
+                            }
+                        }
+                    }
+                }
+                return PlaceResult {
+                    interacted: true,
+                    water_evaporated_pos: Some(target_pos),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+
+    // 3. Pre-Lua Obsidian Portal Ignition (Flint & Steel / Fire Charge in Overworld or Nether)
+    if let Some(ref hname) = held_name {
+        if is_portal_igniter(hname) && is_obsidian(under_id, registries) {
+            if let Some(frame) = try_ignite_portal(world, registries, hit.above) {
+                if !creative {
+                    let ps = player_state.write();
+                    let mut mg = ps.meta.write();
+                    if let Some(main) = mg.inventories.get_mut("main") {
+                        if let Some(slot) = main.get_mut(slot_idx) {
+                            if hname.to_ascii_lowercase().contains("fire_charge") {
+                                if slot.count > 1 {
+                                    slot.count -= 1;
+                                } else {
+                                    *slot = ItemStackData::default();
+                                }
+                            } else {
+                                let nw = (slot.wear as u32).saturating_add(1024);
+                                if nw >= 65535 {
+                                    *slot = ItemStackData::default();
+                                } else {
+                                    slot.wear = nw as u16;
+                                }
+                            }
+                        }
+                    }
+                }
+                return PlaceResult {
+                    interacted: true,
+                    portal_ignited: Some(frame.origin),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+
+    // 3b. Pre-Lua Empty Bucket Liquid Scoop
+    if let Some(ref hname) = held_name {
+        if is_empty_bucket_item(hname) {
+            let filled_bucket = if is_water_source_name(under_name) {
+                Some("mcl_buckets:bucket_water")
+            } else if is_lava_source_name(under_name) {
+                Some("mcl_buckets:bucket_lava")
+            } else {
+                None
+            };
+            if let Some(target_bucket) = filled_bucket {
+                if registries.items.contains_key(target_bucket) {
+                    world.set_node(hit.under, CONTENT_AIR, 15, 0);
+                    world.mark_priority_dirty_with_neighbors(hit.under);
+                    relight_around_pos(world, hit.under, registries);
+                    if !creative {
+                        let mut overflow_item = false;
+                        {
+                            let ps = player_state.read();
+                            let mut mg = ps.meta.write();
+                            if let Some(main) = mg.inventories.get_mut("main") {
+                                if let Some(slot) = main.get_mut(slot_idx) {
+                                    if slot.count <= 1 {
+                                        *slot = ItemStackData::from_spec(&format!(
+                                            "{target_bucket} 1"
+                                        ));
+                                    } else {
+                                        slot.count -= 1;
+                                        overflow_item = true;
+                                    }
+                                }
+                            }
+                        }
+                        if overflow_item {
+                            add_drops_to_inventory(
+                                player_state,
+                                &[format!("{target_bucket} 1")],
+                                registries,
+                            );
+                        }
+                    }
+                    return PlaceResult {
+                        interacted: true,
+                        placed: true,
+                        placed_pos: Some(hit.under),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+    }
+
+    // 3c. Pre-Lua Water/Lava Bucket Placement & Instant Lava-to-Obsidian Cooling
+    if let Some(ref hname) = held_name {
+        let hl = hname.trim().to_ascii_lowercase();
+        let place_liq_name = if hl == "mcl_buckets:bucket_water"
+            || hl == "mcl_buckets:bucket_river_water"
+            || hl == "bucket:bucket_water"
+        {
+            Some("mcl_core:water_source")
+        } else if hl == "mcl_buckets:bucket_lava" || hl == "bucket:bucket_lava" {
+            Some("mcl_core:lava_source")
+        } else {
+            None
+        };
+        if let Some(liq_name) = place_liq_name {
+            let hit_interactive = !player.is_sneaking
+                && (is_chest_node_name(under_name)
+                    || node_has_meta_formspec(world, hit.under)
+                    || lua_rt.is_some_and(|rt| node_has_on_rightclick(rt, under_name)));
+            if !hit_interactive {
+                let liq_id = registries.get_content_id(liq_name);
+                if liq_id != CONTENT_UNKNOWN {
+                    let liq_place_pos = if under_buildable_to
+                        && !is_water_source_name(under_name)
+                        && !is_lava_source_name(under_name)
+                    {
+                        hit.under
+                    } else {
+                        hit.above
+                    };
+                    let (cur_id, _, _) = world.get_node(liq_place_pos);
+                    let can_replace = cur_id == CONTENT_AIR
+                        || registries
+                            .get_node_def(cur_id)
+                            .is_some_and(|d| d.buildable_to);
+                    if can_replace {
+                        let p1 = registries
+                            .get_node_def(liq_id)
+                            .map(|d| {
+                                if d.light_source > 0 {
+                                    (d.light_source << 4) | 15
+                                } else {
+                                    15
+                                }
+                            })
+                            .unwrap_or(15);
+                        world.set_node(liq_place_pos, liq_id, p1, 0);
+                        world.mark_priority_dirty_with_neighbors(liq_place_pos);
+                        relight_around_pos(world, liq_place_pos, registries);
+                        let _ = cool_lava_around(world, registries, liq_place_pos);
+                        if !creative {
+                            let ps = player_state.read();
+                            let mut mg = ps.meta.write();
+                            if let Some(main) = mg.inventories.get_mut("main") {
+                                if let Some(slot) = main.get_mut(slot_idx) {
+                                    if registries.items.contains_key("mcl_buckets:bucket_empty") {
+                                        *slot =
+                                            ItemStackData::from_spec("mcl_buckets:bucket_empty 1");
+                                    } else if slot.count > 1 {
+                                        slot.count -= 1;
+                                    } else {
+                                        *slot = ItemStackData::default();
+                                    }
+                                }
+                            }
+                        }
+                        return PlaceResult {
+                            interacted: true,
+                            placed: true,
+                            placed_pos: Some(liq_place_pos),
+                            ..Default::default()
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Pre-Lua Generated Structure Loot Chest OR Nether Chest Open Intercept
+    if !player.is_sneaking && is_chest_node_name(under_name) {
+        let is_structure_chest = crate::world::structure_chest_at(
+            hit.under,
+            world.dimension,
+            world.seed,
+            *world.world_type.read(),
+        )
+        .is_some();
+        if is_structure_chest || lua_rt.is_none() || world.dimension.is_nether() {
+            crate::world::ensure_structure_chest_loot(
+                world,
+                hit.under,
+                world.seed,
+                *world.world_type.read(),
+                registries,
+            );
+            return PlaceResult {
+                interacted: true,
+                open_chest_pos: Some(hit.under),
+                ..Default::default()
+            };
+        }
+    }
+
     // Determine whether held item is a placeable node and whether it overlaps the player AABB
     let held_node_def = held_name.as_deref().and_then(|name| {
         let id = registries.get_content_id(name);
@@ -1330,6 +1724,7 @@ pub fn try_interact_or_place(
                         placed: true,
                         placed_pos: Some(pp),
                         sound_place: snd,
+                        ..Default::default()
                     };
                 }
                 world.mark_priority_dirty_with_neighbors(hit.under);
@@ -1338,6 +1733,7 @@ pub fn try_interact_or_place(
                     placed: false,
                     placed_pos: None,
                     sound_place: None,
+                    ..Default::default()
                 };
             }
         } else {
@@ -1403,6 +1799,7 @@ pub fn try_interact_or_place(
         placed: true,
         placed_pos: Some(target_pos),
         sound_place: def.sounds.place.clone(),
+        ..Default::default()
     }
 }
 
@@ -1470,7 +1867,7 @@ pub fn targeted_node_has_interaction(
         .map(|d| d.name.as_str())
         .unwrap_or("");
     let has_rc = lua_rt.is_some_and(|rt| node_has_on_rightclick(rt, under_name));
-    has_rc || node_has_meta_formspec(world, hit.under)
+    has_rc || node_has_meta_formspec(world, hit.under) || is_chest_node_name(under_name)
 }
 
 pub fn try_eat_held_food(
@@ -1637,6 +2034,86 @@ mod tests {
         let comp = tick.completed_dig.expect("glass breaks immediately");
         assert!(comp.drops.is_empty());
         assert!(!comp.picked_up_any);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structure_chest_rightclick_opens_27_slot_loot_formspec() {
+        use crate::registry::DrawType;
+        use crate::ui::formspec::{build_loot_chest_formspec, parse_formspec, FormElement};
+        use crate::world::structures::{locate_nearest_structure, StructureKind};
+        use crate::world::WorldGenType;
+
+        let mut reg = EngineRegistries::new();
+        let chest_id = reg.register_node(NodeDef {
+            name: "mcl_chests:chest".into(),
+            drawtype: DrawType::Mesh,
+            walkable: true,
+            pointable: true,
+            ..Default::default()
+        });
+        let anchor = locate_nearest_structure(
+            StructureKind::NetherFortress,
+            1337,
+            WorldGenType::Default,
+            (0, 0),
+        )
+        .expect("fortress anchor");
+        let chest_pos = anchor.chests[0].0;
+
+        let dir = std::env::temp_dir().join("cubex_rs_struct_chest_rc_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let world = WorldStore::new_for_dimension(
+            &dir,
+            1337,
+            DimensionId::Nether,
+            WorldGenType::Default,
+            crate::world::Difficulty::Normal,
+            crate::world::Gamerules::default(),
+            "Survival",
+        );
+        world.set_node(chest_pos, chest_id, 15, 0);
+
+        let hit = RaycastHit {
+            pos: chest_pos,
+            prev_pos: chest_pos - IVec3::Z,
+            normal: IVec3::NEG_Z,
+            node_id: chest_id,
+            under: chest_pos,
+            above: chest_pos - IVec3::Z,
+            intersection_point: chest_pos.as_vec3(),
+            intersection_normal: Vec3::NEG_Z,
+            box_id: 0,
+            distance_sq: 2.0,
+            param2: 0,
+            neighbors: 0,
+        };
+        let ps = Arc::new(RwLock::new(ObjectState::new_player("Looter")));
+        let pctrl = PlayerController::default();
+
+        assert!(targeted_node_has_interaction(&hit, &world, &reg, None));
+        let pr = try_interact_or_place(&hit, &world, &reg, &pctrl, &ps, None);
+        assert!(pr.interacted && !pr.placed);
+        assert_eq!(pr.open_chest_pos, Some(chest_pos));
+
+        let meta = world.get_node_meta(chest_pos);
+        let g = meta.read();
+        let inv = g.inventories.get("main").expect("27-slot chest inventory");
+        assert_eq!(inv.len(), 27);
+        assert!(inv.iter().any(|s| !s.is_empty()), "loot chest must contain items");
+
+        let title = g
+            .fields
+            .get("infotext")
+            .cloned()
+            .unwrap_or_else(|| "Loot Chest".into());
+        let raw_fs = build_loot_chest_formspec(chest_pos, &title);
+        let parsed = parse_formspec(&raw_fs);
+        assert!(parsed.elements.iter().any(|e| matches!(
+            e,
+            FormElement::InvList { loc, list, w: 9, h: 3, .. }
+                if loc.starts_with("nodemeta:") && list == "main"
+        )));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

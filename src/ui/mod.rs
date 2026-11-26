@@ -1,3 +1,4 @@
+pub mod creative_inventory;
 pub mod death_screen;
 pub mod formspec;
 pub mod hud;

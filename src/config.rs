@@ -161,6 +161,60 @@ impl PlayerInputDevice {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AnisotropyQuality {
+    #[default]
+    Off,
+    X4,
+    X8,
+}
+
+impl AnisotropyQuality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::X4 => "4x",
+            Self::X8 => "8x",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::X4 => "4x",
+            Self::X8 => "8x",
+        }
+    }
+
+    pub fn from_str_loose(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "4" | "4x" | "x4" | "medium" => Self::X4,
+            "8" | "8x" | "x8" | "16" | "16x" | "high" | "on" | "true" => Self::X8,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::X4,
+            Self::X4 => Self::X8,
+            Self::X8 => Self::Off,
+        }
+    }
+
+    pub fn clamp_u16(self) -> u16 {
+        match self {
+            Self::Off => 1,
+            Self::X4 => 4,
+            Self::X8 => 8,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum GraphicsPreset {
     #[default]
     Performance,
@@ -280,6 +334,7 @@ pub struct EngineSettings {
     pub clouds_enabled: bool,
     pub waving_water: bool,
     pub mipmapping: bool,
+    pub anisotropy_quality: AnisotropyQuality,
     pub gui_scale: f32,
     pub brightness: f32,
     pub audio: AudioSettings,
@@ -300,6 +355,8 @@ pub struct EngineSettings {
     pub p2_name: String,
     pub p3_name: String,
     pub p4_name: String,
+    pub player_skin: String,
+    pub p2_skin: String,
     pub p1_input: PlayerInputDevice,
     pub p2_input: PlayerInputDevice,
     pub p3_input: PlayerInputDevice,
@@ -349,6 +406,7 @@ impl Default for EngineSettings {
             clouds_enabled: true,
             waving_water: true,
             mipmapping: false,
+            anisotropy_quality: AnisotropyQuality::Off,
             gui_scale: 1.0,
             brightness: 1.0,
             audio: AudioSettings::default(),
@@ -369,6 +427,8 @@ impl Default for EngineSettings {
             p2_name: "Player2".into(),
             p3_name: "Player3".into(),
             p4_name: "Player4".into(),
+            player_skin: "default".into(),
+            p2_skin: "default".into(),
             p1_input: PlayerInputDevice::KeyboardMouse,
             p2_input: PlayerInputDevice::Gamepad(0),
             p3_input: PlayerInputDevice::Gamepad(1),
@@ -398,6 +458,22 @@ impl EngineSettings {
             1 => &mut self.p2_name,
             2 => &mut self.p3_name,
             _ => &mut self.p4_name,
+        }
+    }
+
+    pub fn player_skin_for_slot(&self, slot: usize) -> &str {
+        match slot {
+            0 => &self.player_skin,
+            1 => &self.p2_skin,
+            _ => "default",
+        }
+    }
+
+    pub fn set_player_skin_for_slot(&mut self, slot: usize, skin_id: String) {
+        match slot {
+            0 => self.player_skin = skin_id,
+            1 => self.p2_skin = skin_id,
+            _ => {}
         }
     }
 
@@ -444,6 +520,8 @@ impl EngineSettings {
                 self.block_shatter_physics = false;
                 self.wind_swaying_foliage = false;
                 self.extruded_held_items = true;
+                self.mipmapping = false;
+                self.anisotropy_quality = AnisotropyQuality::Off;
                 self.graphics = GraphicsQuality::Fast;
             }
             GraphicsPreset::Balanced => {
@@ -456,6 +534,8 @@ impl EngineSettings {
                 self.block_shatter_physics = true;
                 self.wind_swaying_foliage = true;
                 self.extruded_held_items = true;
+                self.mipmapping = true;
+                self.anisotropy_quality = AnisotropyQuality::X8;
                 self.graphics = GraphicsQuality::Fancy;
             }
             GraphicsPreset::Cinematic => {
@@ -468,6 +548,8 @@ impl EngineSettings {
                 self.block_shatter_physics = true;
                 self.wind_swaying_foliage = true;
                 self.extruded_held_items = true;
+                self.mipmapping = true;
+                self.anisotropy_quality = AnisotropyQuality::X8;
                 self.graphics = GraphicsQuality::Fabulous;
             }
             GraphicsPreset::Custom => {}
@@ -544,7 +626,16 @@ impl EngineSettings {
             self.block_shatter_physics = loaded.block_shatter_physics;
             self.wind_swaying_foliage = loaded.wind_swaying_foliage;
             self.extruded_held_items = loaded.extruded_held_items;
+            self.dynamic_shadows = loaded.dynamic_shadows;
+            self.anisotropy_quality = loaded.anisotropy_quality;
+            self.mipmapping = loaded.anisotropy_quality.is_enabled() || loaded.mipmapping;
             self.graphics = loaded.graphics;
+            if !loaded.player_skin.trim().is_empty() {
+                self.player_skin = loaded.player_skin;
+            }
+            if !loaded.p2_skin.trim().is_empty() {
+                self.p2_skin = loaded.p2_skin;
+            }
         }
     }
 }
@@ -590,6 +681,8 @@ impl MinetestConfig {
         m.insert("cubex_block_shatter_physics".into(), "false".into());
         m.insert("cubex_wind_swaying_foliage".into(), "false".into());
         m.insert("cubex_extruded_held_items".into(), "true".into());
+        m.insert("mip_map".into(), "false".into());
+        m.insert("cubex_anisotropy".into(), "off".into());
         m.insert("liquids_pointable".into(), "false".into());
         m.insert("enable_shaders".into(), "true".into());
         m.insert("enable_waving_water".into(), "true".into());
@@ -637,6 +730,8 @@ impl MinetestConfig {
         m.insert("cubex_controller_deadzone".into(), "0.14".into());
         m.insert("cubex_controller_invert".into(), "false".into());
         m.insert("cubex_touch_controls".into(), "false".into());
+        m.insert("cubex_player_skin".into(), "default".into());
+        m.insert("cubex_p2_skin".into(), "default".into());
         m.insert("cubex_touch_sens".into(), "1.00".into());
         m
     }
@@ -719,7 +814,14 @@ impl MinetestConfig {
         es.liquids_pointable = self.get_bool("liquids_pointable", false);
         es.clouds_enabled = es.procedural_sky_clouds;
         es.waving_water = self.get_bool("enable_waving_water", true);
-        es.mipmapping = self.get_bool("mip_map", false);
+        es.anisotropy_quality = if let Some(a) = self.get("cubex_anisotropy") {
+            AnisotropyQuality::from_str_loose(a)
+        } else if self.get_bool("mip_map", false) {
+            AnisotropyQuality::X8
+        } else {
+            AnisotropyQuality::Off
+        };
+        es.mipmapping = es.anisotropy_quality.is_enabled();
         es.gui_scale = self.get_f32("gui_scaling", 1.0).clamp(0.75, 2.0);
         es.brightness = self.get_f32("display_gamma", 1.0).clamp(0.5, 1.5);
         es.audio.master = self.get_f32("sound_volume", 0.80).clamp(0.0, 1.0);
@@ -796,6 +898,16 @@ impl MinetestConfig {
         es.controller_sensitivity = self.get_f32("cubex_controller_sens", 1.0).clamp(0.25, 3.0);
         es.controller_deadzone = self.get_f32("cubex_controller_deadzone", 0.14).clamp(0.05, 0.35);
         es.controller_invert_y = self.get_bool("cubex_controller_invert", false);
+        if let Some(sk) = self.get("cubex_player_skin") {
+            if !sk.trim().is_empty() {
+                es.player_skin = sk.trim().to_string();
+            }
+        }
+        if let Some(sk2) = self.get("cubex_p2_skin") {
+            if !sk2.trim().is_empty() {
+                es.p2_skin = sk2.trim().to_string();
+            }
+        }
         es.touch_controls = self.get_bool("cubex_touch_controls", false);
         es.touch_sensitivity = self.get_f32("cubex_touch_sens", 1.0).clamp(0.25, 3.0);
         es.gamerules = Gamerules {
@@ -834,7 +946,8 @@ impl MinetestConfig {
         self.set("enable_clouds", es.procedural_sky_clouds);
         self.set("enable_waving_water", es.waving_water);
         self.set("enable_waving_leaves", es.wind_swaying_foliage);
-        self.set("mip_map", es.mipmapping);
+        self.set("cubex_anisotropy", es.anisotropy_quality.as_str());
+        self.set("mip_map", es.anisotropy_quality.is_enabled() || es.mipmapping);
         self.set("gui_scaling", format!("{:.2}", es.gui_scale));
         self.set("display_gamma", format!("{:.2}", es.brightness));
         self.set("sound_volume", format!("{:.2}", es.audio.master));
@@ -870,6 +983,8 @@ impl MinetestConfig {
         self.set("cubex_controller_deadzone", format!("{:.2}", es.controller_deadzone));
         self.set("cubex_controller_invert", es.controller_invert_y);
         self.set("cubex_touch_controls", es.touch_controls);
+        self.set("cubex_player_skin", &es.player_skin);
+        self.set("cubex_p2_skin", &es.p2_skin);
         self.set("cubex_touch_sens", format!("{:.2}", es.touch_sensitivity));
         self.set("mcl_keepInventory", es.gamerules.keep_inventory);
         self.set("cubex_do_daylight_cycle", es.gamerules.do_daylight_cycle);
@@ -946,6 +1061,8 @@ mod tests {
         assert!(!def.block_shatter_physics);
         assert!(!def.wind_swaying_foliage);
         assert!(def.extruded_held_items);
+        assert_eq!(def.anisotropy_quality, AnisotropyQuality::Off);
+        assert!(!def.mipmapping);
 
         let mut es = def.clone();
         es.apply_graphics_preset(GraphicsPreset::Balanced);
@@ -959,6 +1076,8 @@ mod tests {
         assert!(es.block_shatter_physics);
         assert!(es.wind_swaying_foliage);
         assert!(es.extruded_held_items);
+        assert_eq!(es.anisotropy_quality, AnisotropyQuality::X8);
+        assert!(es.mipmapping);
 
         es.apply_graphics_preset(GraphicsPreset::Cinematic);
         assert_eq!(es.graphics_preset, GraphicsPreset::Cinematic);
@@ -966,10 +1085,13 @@ mod tests {
         assert_eq!(es.cloud_octaves(), 4);
         assert!(es.dynamic_shadows);
         assert!(es.bloom_glow);
+        assert_eq!(es.anisotropy_quality, AnisotropyQuality::X8);
 
         es.bloom_glow = false;
         es.wind_swaying_foliage = false;
         es.procedural_sky_clouds = false;
+        es.anisotropy_quality = AnisotropyQuality::X4;
+        es.mipmapping = true;
         es.sync_graphics_preset_from_toggles();
         assert_eq!(es.graphics_preset, GraphicsPreset::Custom);
         assert_eq!(es.cloud_octaves(), 0);
@@ -987,6 +1109,7 @@ mod tests {
         assert!(loaded.block_shatter_physics);
         assert!(!loaded.wind_swaying_foliage);
         assert!(loaded.extruded_held_items);
+        assert_eq!(loaded.anisotropy_quality, AnisotropyQuality::X4);
 
         // MinetestConfig roundtrip too
         let conf_path = dir.join("minetest.conf");
@@ -1003,6 +1126,8 @@ mod tests {
         assert_eq!(mc_loaded.block_shatter_physics, es.block_shatter_physics);
         assert_eq!(mc_loaded.wind_swaying_foliage, es.wind_swaying_foliage);
         assert_eq!(mc_loaded.extruded_held_items, es.extruded_held_items);
+        assert_eq!(mc_loaded.anisotropy_quality, AnisotropyQuality::X4);
+        assert!(mc_loaded.mipmapping);
 
         // Partial/legacy TOML backward compatibility via #[serde(default)]
         let partial_path = dir.join("partial.toml");
@@ -1013,6 +1138,48 @@ mod tests {
         assert!(partial.procedural_sky_clouds);
         assert_eq!(partial.graphics_preset, GraphicsPreset::Performance);
         assert!(partial.extruded_held_items);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skin_selection_settings_toml_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("cubex_skin_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join("settings.toml");
+        let conf_path = dir.join("minetest.conf");
+
+        let defaults = EngineSettings::default();
+        assert_eq!(defaults.player_skin, "default");
+        assert_eq!(defaults.p2_skin, "default");
+        assert_eq!(defaults.player_skin_for_slot(0), "default");
+        assert_eq!(defaults.player_skin_for_slot(1), "default");
+
+        let mut cfg = defaults.clone();
+        cfg.set_player_skin_for_slot(0, "carterpcs.png".into());
+        cfg.set_player_skin_for_slot(1, "default".into());
+        cfg.save_toml(&toml_path).unwrap();
+
+        let reloaded = EngineSettings::load_toml(&toml_path).unwrap();
+        assert_eq!(reloaded.player_skin, "carterpcs.png");
+        assert_eq!(reloaded.p2_skin, "default");
+
+        let mut overlaid = EngineSettings::default();
+        overlaid.overlay_graphics_from_toml(&toml_path);
+        assert_eq!(overlaid.player_skin, "carterpcs.png");
+        assert_eq!(overlaid.p2_skin, "default");
+
+        let mut mt = MinetestConfig::load(&conf_path);
+        mt.apply_engine_settings(&cfg);
+        mt.save().unwrap();
+
+        let mt_reloaded = MinetestConfig::load(&conf_path);
+        assert_eq!(mt_reloaded.get("cubex_player_skin"), Some("carterpcs.png"));
+        assert_eq!(mt_reloaded.get("cubex_p2_skin"), Some("default"));
+        let back = mt_reloaded.to_engine_settings("default");
+        assert_eq!(back.player_skin, "carterpcs.png");
+        assert_eq!(back.p2_skin, "default");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

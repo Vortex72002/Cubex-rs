@@ -2,8 +2,9 @@ pub mod collision;
 pub mod raycast;
 
 pub use collision::{
-    collision_move_simple, collision_move_simple_ex, Aabb, CollisionAxis, CollisionInfo,
-    CollisionMoveResult, FallEvent, GameMode, MoveInput, PlayerController, StepEvents,
+    collision_move_simple, collision_move_simple_ex, log_player_damage, Aabb, CollisionAxis,
+    CollisionInfo, CollisionMoveResult, DamageSource, FallEvent, GameMode, MoveInput,
+    PlayerController, StepEvents,
 };
 pub use raycast::{
     add_drops_to_inventory, box_line_collision, dig_targeted, dir_to_facedir, dir_to_wallmounted,
@@ -916,5 +917,190 @@ mod tests {
         }
         assert_eq!(p.hp, 0, "Hard difficulty starvation must be lethal at 0 HP");
         assert_eq!(p.death_cause, "Starved to death");
+    }
+
+    #[test]
+    fn walking_50_blocks_mixed_terrain_snow_grass_slabs_steps_deals_zero_damage() {
+        let mut reg = EngineRegistries::new();
+        let dirt = reg.register_node(NodeDef {
+            name: "mcl_core:dirt".into(),
+            drawtype: DrawType::Normal,
+            walkable: true,
+            pointable: true,
+            damage_per_second: 5,
+            ..Default::default()
+        });
+        let grass = reg.register_node(NodeDef {
+            name: "mcl_core:dirt_with_grass".into(),
+            drawtype: DrawType::Normal,
+            walkable: true,
+            pointable: true,
+            damage_per_second: 4,
+            ..Default::default()
+        });
+        let snow_block = reg.register_node(NodeDef {
+            name: "mcl_core:snowblock".into(),
+            drawtype: DrawType::Normal,
+            walkable: true,
+            pointable: true,
+            damage_per_second: 4,
+            ..Default::default()
+        });
+        let snow_layer = reg.register_node(NodeDef {
+            name: "mcl_core:snow".into(),
+            drawtype: DrawType::NodeBox,
+            node_box_type: "fixed".into(),
+            node_boxes: vec![[-0.5, -0.5, -0.5, 0.5, -0.375, 0.5]],
+            walkable: true,
+            pointable: true,
+            damage_per_second: 3,
+            ..Default::default()
+        });
+        let tall_grass = reg.register_node(NodeDef {
+            name: "mcl_flowers:tallgrass".into(),
+            drawtype: DrawType::Plantlike,
+            walkable: false,
+            pointable: true,
+            damage_per_second: 2,
+            ..Default::default()
+        });
+        let slab = reg.register_node(NodeDef {
+            name: "mcl_stairs:slab_stone".into(),
+            drawtype: DrawType::NodeBox,
+            node_box_type: "fixed".into(),
+            node_boxes: vec![[-0.5, -0.5, -0.5, 0.5, 0.0, 0.5]],
+            walkable: true,
+            pointable: true,
+            damage_per_second: 6,
+            ..Default::default()
+        });
+        let water = reg.register_node(NodeDef {
+            name: "mcl_core:water_source".into(),
+            drawtype: DrawType::Liquid,
+            walkable: false,
+            groups: HashMap::from([("water".into(), 3)]),
+            damage_per_second: 4,
+            ..Default::default()
+        });
+
+        for id in [dirt, grass, snow_block, snow_layer, tall_grass, slab, water] {
+            let def = reg.get_node_def(id).expect("node registered");
+            assert_eq!(
+                def.damage_per_second, 0,
+                "Safe terrain node {} must force damage_per_second=0",
+                def.name
+            );
+        }
+
+        let world = make_world("walk_50_mixed");
+        for x in -2..=72 {
+            for z in -1..=1 {
+                let base = if x <= 15 {
+                    grass
+                } else if x <= 30 {
+                    snow_block
+                } else {
+                    dirt
+                };
+                world.set_node(IVec3::new(x, 0, z), base, 15, 0);
+            }
+            if (4..=12).contains(&x) {
+                world.set_node(IVec3::new(x, 1, 0), tall_grass, 15, 0);
+                world.set_node(IVec3::new(x, 2, 0), tall_grass, 15, 0);
+                // Side walls at head height to ensure brushing walls does not suffocate
+                world.set_node(IVec3::new(x, 1, -1), dirt, 15, 0);
+                world.set_node(IVec3::new(x, 2, -1), dirt, 15, 0);
+                world.set_node(IVec3::new(x, 1, 1), dirt, 15, 0);
+                world.set_node(IVec3::new(x, 2, 1), dirt, 15, 0);
+            }
+            if (18..=28).contains(&x) && x % 2 == 0 {
+                world.set_node(IVec3::new(x, 1, 0), snow_layer, 15, 0);
+            }
+            if (32..=36).contains(&x) || (39..=44).contains(&x) {
+                world.set_node(IVec3::new(x, 1, 0), slab, 15, 0);
+            }
+            if x == 37 {
+                world.set_node(IVec3::new(x, 1, 0), water, 15, 0);
+            }
+            if (46..=51).contains(&x) {
+                for z in -1..=1 {
+                    world.set_node(IVec3::new(x, 1, z), dirt, 15, 0);
+                }
+            }
+            if (52..=57).contains(&x) {
+                for z in -1..=1 {
+                    world.set_node(IVec3::new(x, 1, z), dirt, 15, 0);
+                    world.set_node(IVec3::new(x, 2, z), dirt, 15, 0);
+                }
+            }
+            if (58..=63).contains(&x) {
+                for z in -1..=1 {
+                    world.set_node(IVec3::new(x, 1, z), dirt, 15, 0);
+                }
+            }
+        }
+
+        let mut p = PlayerController::default();
+        p.pos = Vec3::new(0.5, 1.0, 0.5);
+        p.on_ground = true;
+        p.yaw = -std::f32::consts::FRAC_PI_2; // +X forward
+        let settings = EngineSettings {
+            auto_jump: true,
+            ..Default::default()
+        };
+        let mut inp = MoveInput::default();
+        inp.forward = true;
+        let dts = [0.016f32, 0.033, 0.022, 0.041, 0.018];
+        for i in 0..900 {
+            if i == 100 {
+                // Nudge right up against wall z=1 side during wall-adjacent segment
+                p.pos.z = 0.69;
+            } else if i == 160 {
+                p.pos.z = 0.5;
+            }
+            p.step(dts[i % dts.len()], &inp, &world, &reg, &settings);
+            assert_eq!(
+                p.hp, 20,
+                "Player took unexpected damage at tick {i}, pos={:?}, cause={:?}",
+                p.pos, p.death_cause
+            );
+            if p.pos.x >= 66.0 {
+                break;
+            }
+        }
+        assert!(
+            p.pos.x >= 55.0,
+            "Expected player to walk at least 55 blocks across mixed terrain, reached x={}",
+            p.pos.x
+        );
+        // Settle cleanly on ground
+        inp.forward = false;
+        for _ in 0..20 {
+            p.step(0.02, &inp, &world, &reg, &settings);
+            assert_eq!(p.hp, 20);
+        }
+        assert_eq!(p.fall_distance, 0.0, "fall_distance must reset to 0 on ground");
+
+        // Drops <= 3.5 blocks deal 0 fall damage
+        p.pos = Vec3::new(1.5, 4.2, 0.5);
+        p.vel = Vec3::ZERO;
+        p.on_ground = false;
+        p.reset_fall_state();
+        for _ in 0..120 {
+            p.step(0.02, &MoveInput::default(), &world, &reg, &settings);
+        }
+        assert!(p.on_ground);
+        assert_eq!(p.hp, 20, "3.2-block drop should deal 0 fall damage");
+
+        // Drops > 3.5 blocks still deal real fall damage
+        p.pos = Vec3::new(1.5, 7.5, 0.5);
+        p.vel = Vec3::ZERO;
+        p.on_ground = false;
+        p.reset_fall_state();
+        for _ in 0..160 {
+            p.step(0.02, &MoveInput::default(), &world, &reg, &settings);
+        }
+        assert!(p.on_ground);
+        assert!(p.hp < 20, "6.5-block drop should deal fall damage, got hp={}", p.hp);
     }
 }

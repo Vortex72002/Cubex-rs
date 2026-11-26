@@ -1,11 +1,30 @@
 pub mod biome;
+pub mod dimension;
 pub mod light;
 pub mod mapgen;
+pub mod mobs;
+pub mod nether;
 pub mod persistence;
+pub mod portal;
 pub mod schematic;
+pub mod structures;
 
 pub use biome::{biome_name_at, sample_biome, GenBiome, SEA_LEVEL};
+pub use dimension::{scale_portal_coords, DimensionId};
 pub use mapgen::chunk_y_range_for;
+pub use mobs::{
+    GuardianLaserBeam, MeleeNativeResult, MobAiState, MobManager, MobParticleEvent,
+    MobParticleKind, MobPlayerDamage, MobPlayerInput, MobProjectile, MobTickEvents, NativeMob,
+    NativeMobKind, ProjectileKind, MAX_ACTIVE_MOBS_PER_DIM,
+};
+pub use nether::{
+    nether_biome_name_at, NetherBiome, NetherPalette, NETHER_CHUNK_Y_RANGE, NETHER_LAVA_LEVEL,
+};
+pub use portal::{PortalAxis, PortalFrame};
+pub use structures::{
+    ensure_structure_chest_loot, locate_nearest_structure, populate_structure_chests_for_chunk,
+    structure_chest_at, LootTableKind, StructureAnchor, StructureKind, StructurePalette,
+};
 
 use glam::IVec3;
 use parking_lot::RwLock;
@@ -319,6 +338,7 @@ pub struct WorldStore {
     pub node_timers: RwLock<HashMap<IVec3, NodeTimerState>>,
     pub world_path: PathBuf,
     pub seed: u64,
+    pub dimension: DimensionId,
     pub world_type: RwLock<WorldGenType>,
     pub difficulty: RwLock<Difficulty>,
     pub gamerules: RwLock<Gamerules>,
@@ -345,6 +365,26 @@ impl WorldStore {
         gamerules: Gamerules,
         gamemode: impl Into<String>,
     ) -> Self {
+        Self::new_for_dimension(
+            world_path,
+            seed,
+            DimensionId::Overworld,
+            world_type,
+            difficulty,
+            gamerules,
+            gamemode,
+        )
+    }
+
+    pub fn new_for_dimension(
+        world_path: impl AsRef<Path>,
+        seed: u64,
+        dimension: DimensionId,
+        world_type: WorldGenType,
+        difficulty: Difficulty,
+        gamerules: Gamerules,
+        gamemode: impl Into<String>,
+    ) -> Self {
         let wp = world_path.as_ref().to_path_buf();
         let _ = std::fs::create_dir_all(&wp);
         Self {
@@ -355,11 +395,20 @@ impl WorldStore {
             node_timers: RwLock::new(HashMap::new()),
             world_path: wp,
             seed,
+            dimension,
             world_type: RwLock::new(world_type),
             difficulty: RwLock::new(difficulty),
             gamerules: RwLock::new(gamerules),
             gamemode: RwLock::new(gamemode.into()),
         }
+    }
+
+    pub fn has_skylight(&self) -> bool {
+        self.dimension.has_skylight()
+    }
+
+    pub fn dimension_dir(&self) -> PathBuf {
+        self.world_path.join(self.dimension.subdir())
     }
 
     pub fn get_node_meta(&self, pos: IVec3) -> Arc<RwLock<MetaStore>> {
@@ -480,7 +529,13 @@ impl WorldStore {
             } else {
                 let mut map = self.chunks.write();
                 map.entry(cpos)
-                    .or_insert_with(|| Arc::new(RwLock::new(Chunk::new(cpos))))
+                    .or_insert_with(|| {
+                        let mut ch = Chunk::new(cpos);
+                        if !self.has_skylight() {
+                            ch.param1.fill(0);
+                        }
+                        Arc::new(RwLock::new(ch))
+                    })
                     .clone()
             }
         };
@@ -550,8 +605,9 @@ impl WorldStore {
         drop(map);
 
         let total = 18 * 18 * 18;
+        let default_p1 = if self.has_skylight() { 0x0Fu8 } else { 0x00u8 };
         let mut nodes = vec![CONTENT_AIR; total];
-        let mut param1 = vec![0x0Fu8; total];
+        let mut param1 = vec![default_p1; total];
         let mut param2 = vec![0u8; total];
 
         // Fill interior 16x16x16 fast

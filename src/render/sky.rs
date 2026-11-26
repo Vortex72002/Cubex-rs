@@ -94,6 +94,21 @@ pub fn compute_sky_palette(tod: f32) -> SkyPalette {
     }
 }
 
+/// Computes the Nether cavern sky/fog palette (crimson horizon `#3A0B0B` -> ember zenith `#1A0404`).
+pub fn compute_nether_sky_palette() -> SkyPalette {
+    SkyPalette {
+        zenith: [0.011, 0.0014, 0.0014],
+        horizon: [0.042, 0.0033, 0.0033],
+        ground: [0.085, 0.012, 0.0035],
+        sun_color: [0.95, 0.32, 0.09],
+        cloud_color: [0.20, 0.035, 0.020],
+        sun_dir: [0.0, -1.0, 0.0],
+        daylight: 0.0,
+        sunset: 0.0,
+        night: 0.0,
+    }
+}
+
 impl SkyUniform {
     pub fn from_camera(
         view_proj: Mat4,
@@ -102,7 +117,22 @@ impl SkyUniform {
         settings: &EngineSettings,
         bloom_active: bool,
     ) -> Self {
-        let pal = compute_sky_palette(time_of_day);
+        Self::from_camera_for_dimension(view_proj, time_of_day, elapsed_sec, settings, bloom_active, false)
+    }
+
+    pub fn from_camera_for_dimension(
+        view_proj: Mat4,
+        time_of_day: f32,
+        elapsed_sec: f32,
+        settings: &EngineSettings,
+        bloom_active: bool,
+        is_nether: bool,
+    ) -> Self {
+        let pal = if is_nether {
+            compute_nether_sky_palette()
+        } else {
+            compute_sky_palette(time_of_day)
+        };
         let inv_vp = if view_proj.determinant().abs() > 1e-6 {
             view_proj.inverse()
         } else {
@@ -110,7 +140,8 @@ impl SkyUniform {
         };
         let warm_flag = if settings.warm_sun_and_atmosphere { 1.0 } else { 0.0 };
         let bloom_flag = if bloom_active { 1.0 } else { 0.0 };
-        let octaves = settings.cloud_octaves() as f32;
+        let octaves = if is_nether { 0.0 } else { settings.cloud_octaves() as f32 };
+        let dim_or_tod = if is_nether { -1.0 } else { time_of_day.max(0.0) };
 
         Self {
             inv_view_proj: inv_vp.to_cols_array_2d(),
@@ -120,7 +151,7 @@ impl SkyUniform {
             ground_color: [pal.ground[0], pal.ground[1], pal.ground[2], pal.night],
             sun_color: [pal.sun_color[0], pal.sun_color[1], pal.sun_color[2], octaves],
             cloud_color: [pal.cloud_color[0], pal.cloud_color[1], pal.cloud_color[2], 0.46],
-            params: [warm_flag, bloom_flag, settings.brightness, time_of_day],
+            params: [warm_flag, bloom_flag, settings.brightness, dim_or_tod],
         }
     }
 }

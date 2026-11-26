@@ -1,12 +1,13 @@
 use egui::{Align2, Color32, Pos2, Rect, Stroke, Vec2};
+use std::collections::HashMap;
 
 use crate::config::{EngineSettings, GraphicsPreset, MinetestConfig};
 use crate::network::tunnel::PlayitTunnelManager;
 use crate::physics::GameMode;
-use crate::textures::ResourcePackInfo;
+use crate::textures::{is_carterpcs_skin, ResourcePackInfo, SkinInfo};
 use crate::ui::theme::{
     mc_button, mc_button_styled, mc_button_with_sound, mc_shadow_text, mc_slider_f32,
-    paint_pause_overlay, McTheme,
+    paint_pause_overlay, paint_player_skin_card, McTheme,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub enum PausePage {
     Audio,
     Controls,
     Coop,
+    Skins,
     WorldCheats,
     WanInvite,
     ResourcePacks,
@@ -49,6 +51,10 @@ pub struct PauseMenuState {
     pub lan_active_addr: Option<String>,
     /// Live list of detected controller descriptions (populated each frame by main loop).
     pub connected_controllers: Vec<String>,
+    /// Scanned player skins from `assets/skins/*.png` (plus Default).
+    pub available_skins: Vec<SkinInfo>,
+    pub skin_edit_slot: usize,
+    pub skin_preview_handles: HashMap<String, egui::TextureHandle>,
 }
 
 impl Default for PauseMenuState {
@@ -61,6 +67,9 @@ impl Default for PauseMenuState {
             copied_notice: None,
             lan_active_addr: None,
             connected_controllers: Vec::new(),
+            available_skins: Vec::new(),
+            skin_edit_slot: 0,
+            skin_preview_handles: HashMap::new(),
         }
     }
 }
@@ -171,15 +180,18 @@ pub fn render_pause_menu(
 
                     let coop_lbl = if settings.coop_mode.is_active() {
                         format!(
-                            "Local Co-op: {} ({}P)",
+                            "Co-op: {} ({}P)",
                             settings.coop_mode.label(),
                             settings.coop_mode.active_player_count(settings.coop_player_count)
                         )
                     } else {
-                        "Local Co-op & Controllers...".to_string()
+                        "Local Co-op...".to_string()
                     };
-                    if place_btn(ui, theme, cx - w * 0.5, y, w, 42.0, &coop_lbl, settings.coop_mode.is_active()) {
+                    if place_btn(ui, theme, cx - w * 0.5, y, half, 42.0, &coop_lbl, settings.coop_mode.is_active()) {
                         state.page = PausePage::Coop;
+                    }
+                    if place_btn(ui, theme, cx + gap * 0.5, y, half, 42.0, "Skins...", is_carterpcs_skin(&settings.player_skin)) {
+                        state.page = PausePage::Skins;
                     }
                     y += 54.0;
 
@@ -287,9 +299,24 @@ pub fn render_pause_menu(
                                     settings.vsync = !settings.vsync;
                                     action = PauseAction::ApplySettings;
                                 }
-                                let mm_lbl = format!("Mipmapping: {}", if settings.mipmapping { "ON" } else { "OFF" });
-                                if mc_button_styled(ui, theme, &mm_lbl, col_w, 40.0, settings.mipmapping).clicked() {
-                                    settings.mipmapping = !settings.mipmapping;
+                                let mm_lbl = format!(
+                                    "Anisotropic & Mipmap: {}",
+                                    settings.anisotropy_quality.label()
+                                );
+                                if mc_button_styled(
+                                    ui,
+                                    theme,
+                                    &mm_lbl,
+                                    col_w,
+                                    40.0,
+                                    settings.anisotropy_quality.is_enabled(),
+                                )
+                                .clicked()
+                                {
+                                    settings.anisotropy_quality =
+                                        settings.anisotropy_quality.cycle();
+                                    settings.mipmapping =
+                                        settings.anisotropy_quality.is_enabled();
                                     action = PauseAction::ApplySettings;
                                 }
                                 ui.end_row();
@@ -760,6 +787,38 @@ pub fn render_pause_menu(
                         state.page = PausePage::Main;
                     }
                 }
+
+                PausePage::Skins => {
+                    mc_shadow_text(p, Pos2::new(cx, top), Align2::CENTER_CENTER, "Player Skins", 22.0, Color32::WHITE);
+                    let w = (screen.width() * 0.68).clamp(520.0, 740.0);
+                    let panel_r = Rect::from_min_max(
+                        Pos2::new(cx - w * 0.5, top + 34.0),
+                        Pos2::new(cx + w * 0.5, screen.bottom() - 80.0),
+                    );
+                    let skins = state.available_skins.clone();
+                    let time_sec = ctx.input(|i| i.time as f32);
+                    let changed = ui
+                        .allocate_new_ui(egui::UiBuilder::new().max_rect(panel_r), |ui| {
+                            paint_skin_selector_panel(
+                                ctx,
+                                ui,
+                                theme,
+                                settings,
+                                &skins,
+                                &mut state.skin_edit_slot,
+                                &mut state.skin_preview_handles,
+                                panel_r,
+                                time_sec,
+                            )
+                        })
+                        .inner;
+                    if changed {
+                        action = PauseAction::ApplySettings;
+                    }
+                    if place_btn(ui, theme, cx - 120.0, screen.bottom() - 62.0, 240.0, 42.0, "Done", true) {
+                        state.page = PausePage::Main;
+                    }
+                }
             }
         });
 
@@ -1062,6 +1121,133 @@ pub fn paint_enhanced_graphics_controls(
                 changed = true;
             }
         });
+    changed
+}
+
+/// Shared Player 1 / Player 2 Skins selector used in both Title Screen and Pause Menu.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_skin_selector_panel(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    theme: &McTheme,
+    settings: &mut EngineSettings,
+    skins: &[SkinInfo],
+    active_slot: &mut usize,
+    preview_cache: &mut HashMap<String, egui::TextureHandle>,
+    panel_rect: Rect,
+    time_sec: f32,
+) -> bool {
+    let mut changed = false;
+    let slot = (*active_slot).min(1);
+    *active_slot = slot;
+
+    let tab_w = ((panel_rect.width() - 12.0) * 0.5).max(160.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        let p1_lbl = format!("Player 1: {}", settings.player_name);
+        let p2_lbl = format!("Player 2: {}", settings.p2_name);
+        if mc_button_styled(ui, theme, &p1_lbl, tab_w, 36.0, slot == 0).clicked() {
+            *active_slot = 0;
+        }
+        if mc_button_styled(ui, theme, &p2_lbl, tab_w, 36.0, slot == 1).clicked() {
+            *active_slot = 1;
+        }
+    });
+    ui.add_space(8.0);
+
+    let current_skin_id = settings.player_skin_for_slot(slot).to_string();
+    let card_w = (panel_rect.width() * 0.32).clamp(165.0, 210.0);
+    let list_w = (panel_rect.width() - card_w - 18.0).max(220.0);
+    let body_h = (panel_rect.height() - 56.0).max(180.0);
+
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 14.0;
+        ui.allocate_ui_with_layout(
+            Vec2::new(list_w, body_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_rgba_unmultiplied(10, 12, 16, 185))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(80, 84, 92)))
+                    .inner_margin(egui::Margin::symmetric(8, 8))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height((body_h - 18.0).max(120.0))
+                            .show(ui, |ui| {
+                                if skins.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Place PNG skins inside assets/skins/ to use custom skins.")
+                                            .color(Color32::LIGHT_GRAY),
+                                    );
+                                } else {
+                                    for sk in skins {
+                                        let selected = current_skin_id.eq_ignore_ascii_case(&sk.id)
+                                            || (current_skin_id.trim().is_empty() && sk.id == "default");
+                                        let dims = format!("{}x{}", sk.image.width(), sk.image.height());
+                                        let lbl = if selected {
+                                            format!("{} ({dims}) [SELECTED]", sk.label)
+                                        } else {
+                                            format!("{} ({dims})", sk.label)
+                                        };
+                                        if mc_button_styled(
+                                            ui,
+                                            theme,
+                                            &lbl,
+                                            (list_w - 22.0).max(180.0),
+                                            42.0,
+                                            selected,
+                                        )
+                                        .clicked()
+                                        {
+                                            settings.set_player_skin_for_slot(slot, sk.id.clone());
+                                            changed = true;
+                                        }
+                                        ui.add_space(6.0);
+                                    }
+                                }
+                            });
+                    });
+            },
+        );
+
+        let selected_skin = skins
+            .iter()
+            .find(|s| s.id.eq_ignore_ascii_case(&current_skin_id))
+            .or_else(|| skins.first());
+        let tex_handle = selected_skin.map(|sk| {
+            preview_cache
+                .entry(sk.id.clone())
+                .or_insert_with(|| {
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                        [sk.image.width() as usize, sk.image.height() as usize],
+                        sk.image.as_raw(),
+                    );
+                    ctx.load_texture(
+                        format!("skin_preview_{}", sk.id),
+                        ci,
+                        egui::TextureOptions::NEAREST,
+                    )
+                })
+                .clone()
+        });
+
+        ui.vertical(|ui| {
+            let preview_h = 224.0f32.min((body_h - 40.0).max(180.0));
+            let (card_rect, _) = ui.allocate_exact_size(Vec2::new(card_w, preview_h), egui::Sense::hover());
+            let name = settings.player_name_for_slot(slot);
+            paint_player_skin_card(ui.painter(), card_rect, tex_handle.as_ref(), name, time_sec);
+            if is_carterpcs_skin(&current_skin_id) {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("3D Curly Hair Crown\n+ RAM Stick Mic in Slot 1")
+                        .size(12.0)
+                        .strong()
+                        .color(Color32::from_rgb(120, 248, 136)),
+                );
+            }
+        });
+    });
+
     changed
 }
 

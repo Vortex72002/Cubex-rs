@@ -9,6 +9,7 @@ use crate::registry::{EngineRegistries, CONTENT_AIR, CONTENT_IGNORE};
 
 pub const TILE_SIZE: u32 = 32;
 pub const MAX_ATLAS_LAYERS: usize = 2048;
+pub const NETHER_PORTAL_TEX_NAME: &str = "cubex_nether_portal.png";
 
 #[derive(Debug, Clone)]
 pub struct ResourcePackInfo {
@@ -16,6 +17,261 @@ pub struct ResourcePackInfo {
     pub name: String,
     pub description: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkinInfo {
+    pub id: String,
+    pub label: String,
+    pub path: Option<PathBuf>,
+    pub image: RgbaImage,
+}
+
+pub fn is_carterpcs_skin(skin_id: &str) -> bool {
+    let lower = skin_id.trim().to_ascii_lowercase();
+    lower == "carterpcs.png" || lower == "carterpcs"
+}
+
+fn format_skin_label(file_name: &str) -> String {
+    if is_carterpcs_skin(file_name) {
+        return "CarterPCs".into();
+    }
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_name);
+    let mut words = Vec::new();
+    for part in stem.split(['_', '-', ' ']).filter(|p| !p.is_empty()) {
+        let mut chars = part.chars();
+        if let Some(first) = chars.next() {
+            words.push(format!("{}{}", first.to_ascii_uppercase(), chars.as_str()));
+        }
+    }
+    if words.is_empty() {
+        file_name.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+pub fn list_available_skins(skins_dir: &Path, default_skin: &RgbaImage) -> Vec<SkinInfo> {
+    let mut out = vec![SkinInfo {
+        id: "default".into(),
+        label: "Default".into(),
+        path: None,
+        image: default_skin.clone(),
+    }];
+    if !skins_dir.is_dir() {
+        return out;
+    }
+    let mut entries: Vec<(String, PathBuf)> = std::fs::read_dir(skins_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let ext = path.extension().and_then(|e| e.to_str())?;
+            if !ext.eq_ignore_ascii_case("png") {
+                return None;
+            }
+            let name = path.file_name()?.to_string_lossy().to_string();
+            Some((name, path))
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+
+    for (name, path) in entries {
+        if let Ok(img) = image::open(&path) {
+            let rgba = img.to_rgba8();
+            if rgba.width() >= 32 && rgba.height() >= 16 {
+                out.push(SkinInfo {
+                    id: name.clone(),
+                    label: format_skin_label(&name),
+                    path: Some(path),
+                    image: rgba,
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn resolve_skin_rgba(skins: &[SkinInfo], skin_id: &str, fallback: &RgbaImage) -> RgbaImage {
+    let want = skin_id.trim();
+    if !want.is_empty() && want != "default" {
+        if let Some(found) = skins.iter().find(|s| s.id.eq_ignore_ascii_case(want)) {
+            return found.image.clone();
+        }
+    }
+    skins
+        .first()
+        .map(|s| s.image.clone())
+        .unwrap_or_else(|| fallback.clone())
+}
+
+pub fn synthesize_ram_mic_icon() -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 0]));
+    let green_pcb = Rgba([0x1C, 0x98, 0x46, 255]);
+    let trace_green = Rgba([0x13, 0x6E, 0x32, 255]);
+    let gold_pin = Rgba([0xF2, 0xCA, 0x36, 255]);
+    let dram = Rgba([0x16, 0x18, 0x1C, 255]);
+    let mic_body = Rgba([0x20, 0x23, 0x2A, 255]);
+    let mic_edge = Rgba([0x2E, 0x33, 0x3D, 255]);
+    let white = Rgba([0xF5, 0xF7, 0xFA, 255]);
+    let led = Rgba([0x30, 0xF8, 0x60, 255]);
+
+    // Vertical green DDR4 PCB stick with notch & gold pins on right edge
+    for y in 2..15 {
+        for x in 5..10 {
+            img.put_pixel(x, y, if (y + x) % 3 == 0 { trace_green } else { green_pcb });
+        }
+        if y != 8 {
+            img.put_pixel(10, y, gold_pin);
+        }
+    }
+    // Lower DRAM memory chips
+    for cy in [10u32, 12] {
+        for x in 6..9 {
+            img.put_pixel(x, cy, dram);
+            img.put_pixel(x, cy + 1, dram);
+        }
+    }
+    // Clipped wireless black square mic on upper half
+    for y in 2..8 {
+        for x in 3..10 {
+            let border = y == 2 || y == 7 || x == 3 || x == 9;
+            img.put_pixel(x, y, if border { mic_edge } else { mic_body });
+        }
+    }
+    // White square emblem + glowing green LED
+    for y in 4..6 {
+        for x in 5..7 {
+            img.put_pixel(x, y, white);
+        }
+    }
+    img.put_pixel(8, 3, led);
+    img
+}
+
+/// Synthesizes an animated-ready swirling purple/magenta Nether portal tile (`32x32` RGBA).
+pub fn synthesize_nether_portal_tile() -> RgbaImage {
+    let mut img = RgbaImage::new(TILE_SIZE, TILE_SIZE);
+    for y in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            let fx = x as f32 / TILE_SIZE as f32;
+            let fy = y as f32 / TILE_SIZE as f32;
+            let swirl = ((fx * std::f32::consts::TAU * 2.0)
+                + (fy * std::f32::consts::TAU).sin() * 1.4)
+                .sin()
+                * 0.5
+                + ((fy * std::f32::consts::TAU * 3.0) - (fx * std::f32::consts::TAU).cos() * 1.2)
+                    .cos()
+                    * 0.5;
+            let ring = (fx - 0.5).hypot(fy - 0.5);
+            let t = (0.5 + 0.35 * swirl + (0.35 - ring) * 0.45).clamp(0.0, 1.0);
+            let r = (74.0 + t * 140.0).round().clamp(0.0, 255.0) as u8;
+            let g = (14.0 + (t * t) * 96.0).round().clamp(0.0, 255.0) as u8;
+            let b = (132.0 + t * 123.0).round().clamp(0.0, 255.0) as u8;
+            let a = (182.0 + t * 56.0).round().clamp(160.0, 240.0) as u8;
+            img.put_pixel(x, y, Rgba([r, g, b, a]));
+        }
+    }
+    img
+}
+
+/// Number of mip levels in a full pyramid down to 1x1.
+pub fn mip_level_count_for(width: u32, height: u32) -> u32 {
+    let max_dim = width.max(height).max(1);
+    32 - max_dim.leading_zeros()
+}
+
+#[inline]
+fn srgb_u8_to_linear(c: u8) -> f32 {
+    let x = c as f32 / 255.0;
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn linear_to_srgb_u8(x: f32) -> u8 {
+    let c = x.clamp(0.0, 1.0);
+    let s = if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Generates a full box-filtered sRGB->linear->sRGB mipmap chain down to `1x1`, strictly clamped
+/// within the tile bounds so neighboring atlas tiles can never bleed across mip levels.
+pub fn generate_box_mip_chain(base: &RgbaImage) -> Vec<RgbaImage> {
+    let mut chain = Vec::with_capacity(mip_level_count_for(base.width(), base.height()) as usize);
+    chain.push(base.clone());
+    while let Some(prev) = chain.last() {
+        let sw = prev.width();
+        let sh = prev.height();
+        if sw <= 1 && sh <= 1 {
+            break;
+        }
+        let nw = (sw / 2).max(1);
+        let nh = (sh / 2).max(1);
+        let mut next = RgbaImage::new(nw, nh);
+        for dy in 0..nh {
+            for dx in 0..nw {
+                let mut sum_r = 0.0f32;
+                let mut sum_g = 0.0f32;
+                let mut sum_b = 0.0f32;
+                let mut sum_w = 0.0f32;
+                let mut sum_a = 0.0f32;
+                let mut max_a = 0.0f32;
+                for oy in 0..2u32 {
+                    for ox in 0..2u32 {
+                        let sx = (dx * 2 + ox).min(sw - 1);
+                        let sy = (dy * 2 + oy).min(sh - 1);
+                        let p = prev.get_pixel(sx, sy).0;
+                        let a = p[3] as f32 / 255.0;
+                        sum_a += a;
+                        if a > max_a {
+                            max_a = a;
+                        }
+                        if a > 0.0 {
+                            sum_r += srgb_u8_to_linear(p[0]) * a;
+                            sum_g += srgb_u8_to_linear(p[1]) * a;
+                            sum_b += srgb_u8_to_linear(p[2]) * a;
+                            sum_w += a;
+                        }
+                    }
+                }
+                let (r, g, b) = if sum_w > 1e-5 {
+                    (
+                        linear_to_srgb_u8(sum_r / sum_w),
+                        linear_to_srgb_u8(sum_g / sum_w),
+                        linear_to_srgb_u8(sum_b / sum_w),
+                    )
+                } else {
+                    (0, 0, 0)
+                };
+                let avg_a = sum_a * 0.25;
+                let out_a = if avg_a > 0.001 && max_a > 0.5 && avg_a < 0.999 {
+                    (avg_a * 1.12).clamp(avg_a, max_a)
+                } else {
+                    avg_a
+                };
+                let a_u8 = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+                next.put_pixel(dx, dy, Rgba([r, g, b, a_u8]));
+            }
+        }
+        chain.push(next);
+    }
+    chain
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +366,13 @@ impl PreloadedTextures {
                 Some((name.clone(), img))
             })
             .collect();
-        let raw_cache: HashMap<String, RgbaImage> = raw_entries.into_iter().collect();
+        let mut raw_cache: HashMap<String, RgbaImage> = raw_entries.into_iter().collect();
+        raw_cache
+            .entry("cubex_ram_mic.png".into())
+            .or_insert_with(synthesize_ram_mic_icon);
+        raw_cache
+            .entry(NETHER_PORTAL_TEX_NAME.into())
+            .or_insert_with(synthesize_nether_portal_tile);
 
         // Parallel load .obj meshes for DrawType::Mesh nodes
         let obj_entries: Vec<(String, ObjMesh)> = model_files
@@ -199,6 +461,14 @@ impl TextureAtlas {
             obj_meshes: preloaded.obj_meshes,
             fallback_layer: 0,
         };
+        atlas
+            .raw_cache
+            .entry("cubex_ram_mic.png".into())
+            .or_insert_with(synthesize_ram_mic_icon);
+        atlas
+            .raw_cache
+            .entry(NETHER_PORTAL_TEX_NAME.into())
+            .or_insert_with(synthesize_nether_portal_tile);
 
         // Pre-intern 10 block-break crack layers (layers 1..=10) so they never overflow MAX_ATLAS_LAYERS
         atlas.crack_layers = atlas.build_crack_layers();
@@ -509,6 +779,9 @@ impl TextureAtlas {
             return None;
         }
         let resolved = reg.resolve_alias(base_name);
+        if resolved == crate::registry::RAM_MIC_ITEM_ID {
+            return Some(synthesize_ram_mic_icon());
+        }
 
         if let Some(idef) = reg.get_item_def(resolved) {
             if !idef.inventory_image.trim().is_empty() {
@@ -792,6 +1065,32 @@ impl TextureAtlas {
             bytes.extend_from_slice(layer.as_raw());
         }
         (TILE_SIZE, TILE_SIZE, count, bytes)
+    }
+
+    /// Generates and packs a full box-filtered mipmap pyramid per layer (`TILE_SIZE -> 1x1`) in
+    /// per-mip layer-major RGBA8 byte slices ready for `wgpu::Queue::write_texture`.
+    pub fn pack_mipmapped_rgba_bytes(&self) -> (u32, u32, u32, u32, Vec<Vec<u8>>) {
+        let count = self.layers.len() as u32;
+        let mip_count = mip_level_count_for(TILE_SIZE, TILE_SIZE);
+        let chains: Vec<Vec<RgbaImage>> = self
+            .layers
+            .par_iter()
+            .map(generate_box_mip_chain)
+            .collect();
+        let mut per_mip = Vec::with_capacity(mip_count as usize);
+        let mut w = TILE_SIZE;
+        let mut h = TILE_SIZE;
+        for m in 0..(mip_count as usize) {
+            let mut buf = Vec::with_capacity((w * h * 4 * count) as usize);
+            for chain in &chains {
+                let img = &chain[m.min(chain.len() - 1)];
+                buf.extend_from_slice(img.as_raw());
+            }
+            per_mip.push(buf);
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        (TILE_SIZE, TILE_SIZE, count, mip_count, per_mip)
     }
 }
 
@@ -1252,5 +1551,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn carterpcs_skin_loads_exact_128x64_and_ram_mic_icon_exists() {
+        let paths = crate::paths::EnginePaths::resolve();
+        assert!(
+            paths.skins_dir.is_dir(),
+            "Expected skins dir {:?} to exist",
+            paths.skins_dir
+        );
+        let placeholder = TextureAtlas::placeholder();
+        let skins = list_available_skins(&paths.skins_dir, &placeholder.player_skin);
+        assert!(skins.iter().any(|s| s.id == "default"));
+        let carter = skins
+            .iter()
+            .find(|s| is_carterpcs_skin(&s.id))
+            .expect("carterpcs.png must be discovered in assets/skins");
+        assert_eq!(carter.image.dimensions(), (128, 64));
+
+        // Verify head overlay quadrant (u: 0.5..1.0 => x: 64..128, y: 0..32) contains opaque hair pixels
+        let mut overlay_opaque = 0usize;
+        for y in 0..32 {
+            for x in 64..128 {
+                if carter.image.get_pixel(x, y).0[3] > 200 {
+                    overlay_opaque += 1;
+                }
+            }
+        }
+        assert!(
+            overlay_opaque > 100,
+            "Expected carterpcs 128x64 head overlay quadrant to contain curly hair pixels, got {overlay_opaque}"
+        );
+
+        let resolved = resolve_skin_rgba(&skins, &carter.id, &placeholder.player_skin);
+        assert_eq!(resolved.dimensions(), (128, 64));
+
+        let ram_icon = synthesize_ram_mic_icon();
+        assert_eq!(ram_icon.dimensions(), (16, 16));
+        assert!(ram_icon.pixels().any(|p| p.0[3] == 255));
+
+        let reg = EngineRegistries::new();
+        let atlas_icon = placeholder
+            .get_item_rgba(crate::registry::RAM_MIC_ITEM_ID, &reg)
+            .expect("cubex:ram_mic icon must resolve");
+        assert_eq!(atlas_icon.dimensions(), (16, 16));
+    }
+
+    #[test]
+    fn mipmap_chain_and_padded_atlas_pack_dimensions_valid() {
+        assert_eq!(mip_level_count_for(32, 32), 6);
+        assert_eq!(mip_level_count_for(16, 16), 5);
+
+        // Transparent neighbor must not darken opaque neighbor during box downsampling
+        let mut cutout_tile = RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, Rgba([0, 0, 0, 0]));
+        for y in 0..TILE_SIZE {
+            for x in 0..(TILE_SIZE / 2) {
+                cutout_tile.put_pixel(x, y, Rgba([220, 240, 200, 255]));
+            }
+        }
+        let chain = generate_box_mip_chain(&cutout_tile);
+        assert_eq!(chain.len(), 6);
+        let expected_dims = [(32, 32), (16, 16), (8, 8), (4, 4), (2, 2), (1, 1)];
+        for (lvl, &(ew, eh)) in expected_dims.iter().enumerate() {
+            assert_eq!(chain[lvl].dimensions(), (ew, eh));
+        }
+        // Fully transparent half at mip 1 stays alpha=0; opaque half stays bright without dark halo
+        assert_eq!(chain[1].get_pixel(12, 8).0[3], 0);
+        assert!(chain[1].get_pixel(2, 8).0[0] >= 215);
+
+        // Check pack_mipmapped_rgba_bytes on placeholder + synthesized portal tile
+        let mut atlas = TextureAtlas::placeholder();
+        let portal_tile = synthesize_nether_portal_tile();
+        assert_eq!(portal_tile.dimensions(), (TILE_SIZE, TILE_SIZE));
+        atlas.layers.push(cutout_tile);
+        atlas.layers.push(portal_tile);
+        let (w, h, layers, mips, packed) = atlas.pack_mipmapped_rgba_bytes();
+        assert_eq!((w, h, layers, mips), (32, 32, 4, 6));
+        assert_eq!(packed.len(), 6);
+        for (m, &(mw, mh)) in expected_dims.iter().enumerate() {
+            assert_eq!(packed[m].len(), (mw * mh * 4 * layers) as usize);
+        }
+
+        let reg = EngineRegistries::new();
+        assert!(reg.get_content_id(crate::registry::NETHER_PORTAL_NODE_ID) != CONTENT_IGNORE);
+        let pre = PreloadedTextures::load(&HashMap::new(), Path::new("/nonexistent"), None);
+        assert!(pre.raw_cache.contains_key(NETHER_PORTAL_TEX_NAME));
     }
 }

@@ -6,14 +6,14 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::lua_api::userdata::ObjectState;
 use crate::registry::{EngineRegistries, CONTENT_UNKNOWN};
 use crate::world::{
-    Chunk, Difficulty, Gamerules, ItemStackData, MetaDataState, NodeTimerState, WorldGenType,
-    WorldStore, CHUNK_VOLUME,
+    Chunk, Difficulty, DimensionId, Gamerules, ItemStackData, MetaDataState, NodeTimerState,
+    WorldGenType, WorldStore, CHUNK_VOLUME,
 };
 
 const MAGIC_CHUNKS: &[u8; 4] = b"CBXC";
@@ -91,6 +91,8 @@ pub struct PersistedPlayer {
     pub breath: u16,
     pub wield_index: usize,
     pub gamemode: String,
+    #[serde(default)]
+    pub dimension: DimensionId,
     pub meta: PersistedMeta,
 }
 
@@ -109,6 +111,7 @@ impl PersistedPlayer {
             breath: obj.breath,
             wield_index: obj.wield_index,
             gamemode: gamemode.to_string(),
+            dimension: obj.dimension,
             meta: PersistedMeta::from_state(&obj.meta.read()),
         }
     }
@@ -124,6 +127,7 @@ impl PersistedPlayer {
         obj.xp_progress = self.xp_progress;
         obj.breath = self.breath;
         obj.wield_index = self.wield_index.max(1);
+        obj.dimension = self.dimension;
         let mut restored = self.meta.to_state();
         let main = restored
             .inventories
@@ -215,6 +219,20 @@ fn write_world_mt(world: &WorldStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn resolve_load_bin(world: &WorldStore, filename: &str) -> Option<PathBuf> {
+    let dim_path = world.dimension_dir().join(filename);
+    if dim_path.is_file() {
+        return Some(dim_path);
+    }
+    if world.dimension == DimensionId::Overworld {
+        let legacy = world.world_path.join(filename);
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+    }
+    None
+}
+
 fn save_chunks_bin(world: &WorldStore, reg: &EngineRegistries) -> anyhow::Result<()> {
     let chunk_arcs: Vec<_> = world.chunks.read().values().cloned().collect();
     let mut modified_chunks = Vec::new();
@@ -257,14 +275,17 @@ fn save_chunks_bin(world: &WorldStore, reg: &EngineRegistries) -> anyhow::Result
         payload.extend_from_slice(&ch.param2);
     }
 
-    write_framed_zlib(&world.world_path.join("chunks.bin"), MAGIC_CHUNKS, &payload)
+    write_framed_zlib(
+        &world.dimension_dir().join("chunks.bin"),
+        MAGIC_CHUNKS,
+        &payload,
+    )
 }
 
 fn load_chunks_bin(world: &WorldStore, reg: &EngineRegistries) -> anyhow::Result<usize> {
-    let path = world.world_path.join("chunks.bin");
-    if !path.is_file() {
+    let Some(path) = resolve_load_bin(world, "chunks.bin") else {
         return Ok(0);
-    }
+    };
     let data = read_framed_zlib(&path, MAGIC_CHUNKS)?;
     let mut cur = 0usize;
     let read_u32 = |d: &[u8], c: &mut usize| -> anyhow::Result<u32> {
@@ -370,14 +391,17 @@ fn save_nodemeta_bin(world: &WorldStore) -> anyhow::Result<()> {
         });
     }
     let payload = serde_json::to_vec(&entries)?;
-    write_framed_zlib(&world.world_path.join("nodemeta.bin"), MAGIC_META, &payload)
+    write_framed_zlib(
+        &world.dimension_dir().join("nodemeta.bin"),
+        MAGIC_META,
+        &payload,
+    )
 }
 
 fn load_nodemeta_bin(world: &WorldStore) -> anyhow::Result<usize> {
-    let path = world.world_path.join("nodemeta.bin");
-    if !path.is_file() {
+    let Some(path) = resolve_load_bin(world, "nodemeta.bin") else {
         return Ok(0);
-    }
+    };
     let data = read_framed_zlib(&path, MAGIC_META)?;
     let entries: Vec<PersistedNodeMetaEntry> = serde_json::from_slice(&data)?;
     let count = entries.len();
@@ -417,11 +441,34 @@ pub fn save_world_players(
     players: &[&ObjectState],
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&world.world_path)?;
-    write_world_mt(world)?;
+    std::fs::create_dir_all(world.dimension_dir())?;
+    if world.dimension == DimensionId::Overworld {
+        write_world_mt(world)?;
+    }
     save_chunks_bin(world, reg)?;
-    save_players_bin(world, players)?;
+    if world.dimension == DimensionId::Overworld {
+        save_players_bin(world, players)?;
+    }
     save_nodemeta_bin(world)?;
     Ok(())
+}
+
+/// Persist modified chunks and node metadata for a single dimension (`world/overworld/` or `world/nether/`).
+pub fn save_dimension_chunks(world: &WorldStore, reg: &EngineRegistries) -> anyhow::Result<()> {
+    std::fs::create_dir_all(world.dimension_dir())?;
+    save_chunks_bin(world, reg)?;
+    save_nodemeta_bin(world)?;
+    Ok(())
+}
+
+/// Load modified chunks and node metadata for a single dimension, returning `(chunks_loaded, meta_loaded)`.
+pub fn load_dimension_chunks(
+    world: &WorldStore,
+    reg: &EngineRegistries,
+) -> anyhow::Result<(usize, usize)> {
+    let chunks_loaded = load_chunks_bin(world, reg)?;
+    let meta_loaded = load_nodemeta_bin(world)?;
+    Ok((chunks_loaded, meta_loaded))
 }
 
 /// Load a specific player's saved state from `players.bin` by exact name (never falling back to Player 1).
@@ -696,6 +743,87 @@ mod tests {
 
         let mut r_p3 = ObjectState::new_player("Player3");
         assert!(load_player_by_name(&reloaded_world, &mut r_p3).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_dimension_persistence_roundtrip() {
+        let dir = std::env::temp_dir().join("cubex_rs_multi_dim_persist");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut reg = EngineRegistries::new();
+        let stone = reg.register_node(NodeDef {
+            name: "mcl_core:stone".into(),
+            ..Default::default()
+        });
+        let netherrack = reg.register_node(NodeDef {
+            name: "mcl_nether:netherrack".into(),
+            ..Default::default()
+        });
+
+        let ow = WorldStore::new_for_dimension(
+            &dir,
+            5151,
+            DimensionId::Overworld,
+            WorldGenType::Default,
+            Difficulty::Normal,
+            Gamerules::default(),
+            "Survival",
+        );
+        let nw = WorldStore::new_for_dimension(
+            &dir,
+            5151,
+            DimensionId::Nether,
+            WorldGenType::Default,
+            Difficulty::Normal,
+            Gamerules::default(),
+            "Survival",
+        );
+
+        let shared_pos = IVec3::new(12, 48, -6);
+        ow.set_node(shared_pos, stone, 15, 0);
+        nw.set_node(shared_pos, netherrack, 0, 0);
+
+        let mut p1 = ObjectState::new_player("PortalTraveler");
+        p1.pos = Vec3::new(12.5, 50.0, -5.5);
+        p1.dimension = DimensionId::Nether;
+
+        save_world(&ow, &reg, Some(&p1)).expect("save overworld + player");
+        save_dimension_chunks(&nw, &reg).expect("save nether chunks");
+
+        assert!(dir.join("overworld/chunks.bin").is_file());
+        assert!(dir.join("nether/chunks.bin").is_file());
+
+        let ow2 = WorldStore::new_for_dimension(
+            &dir,
+            5151,
+            DimensionId::Overworld,
+            WorldGenType::Default,
+            Difficulty::Normal,
+            Gamerules::default(),
+            "Survival",
+        );
+        let nw2 = WorldStore::new_for_dimension(
+            &dir,
+            5151,
+            DimensionId::Nether,
+            WorldGenType::Default,
+            Difficulty::Normal,
+            Gamerules::default(),
+            "Survival",
+        );
+
+        let mut loaded_p1 = ObjectState::new_player("PortalTraveler");
+        let saved = load_world(&ow2, &reg, Some(&mut loaded_p1)).expect("load overworld");
+        let (n_chunks, _) = load_dimension_chunks(&nw2, &reg).expect("load nether");
+
+        assert_eq!(saved.chunks_loaded, 1);
+        assert_eq!(n_chunks, 1);
+        assert_eq!(loaded_p1.dimension, DimensionId::Nether);
+        assert_eq!(saved.player.unwrap().dimension, DimensionId::Nether);
+        assert_eq!(ow2.get_node(shared_pos).0, stone);
+        assert_eq!(nw2.get_node(shared_pos).0, netherrack);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

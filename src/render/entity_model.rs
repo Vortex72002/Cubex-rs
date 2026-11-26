@@ -22,9 +22,35 @@ pub struct EntityRenderSnapshot {
     pub wield_item: String,
     pub walk_phase: f32,
     pub walk_blend: f32,
+    pub anim_time: f32,
+    pub vel_y: f32,
     pub hurt_flash: f32,
     pub sky_light: u8,
     pub block_light: u8,
+}
+
+impl Default for EntityRenderSnapshot {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            entity_name: String::new(),
+            pos: Vec3::ZERO,
+            yaw: 0.0,
+            collisionbox: [-0.4, 0.0, -0.4, 0.4, 1.8, 0.4],
+            visual: "mesh".into(),
+            visual_size: Vec3::ONE,
+            mesh: String::new(),
+            texture_name: String::new(),
+            wield_item: String::new(),
+            walk_phase: 0.0,
+            walk_blend: 0.0,
+            anim_time: 0.0,
+            vel_y: 0.0,
+            hurt_flash: 0.0,
+            sky_light: 15,
+            block_light: 0,
+        }
+    }
 }
 
 impl EntityRenderSnapshot {
@@ -66,6 +92,8 @@ impl EntityRenderSnapshot {
             wield_item: g.wield_item.clone(),
             walk_phase: g.walk_phase,
             walk_blend: g.walk_blend,
+            anim_time: g.walk_phase,
+            vel_y: g.vel.y,
             hurt_flash: g.hurt_flash,
             sky_light: (p1 & 0x0F).max(6),
             block_light: (p1 >> 4) & 0x0F,
@@ -76,6 +104,13 @@ impl EntityRenderSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityRigKind {
     Biped,
+    ZombiePiglin,
+    WitherSkeleton,
+    Blaze,
+    Ghast,
+    MagmaCube,
+    Guardian,
+    Fireball,
     Cow,
     Pig,
     Sheep,
@@ -103,6 +138,31 @@ pub fn classify_entity_rig(ent: &EntityRenderSnapshot) -> EntityRigKind {
     }
     let lower_name = ent.entity_name.to_ascii_lowercase();
     let lower_mesh = ent.mesh.to_ascii_lowercase();
+    if lower_name.contains("fireball") {
+        return EntityRigKind::Fireball;
+    }
+    if lower_name.contains("pigman")
+        || lower_name.contains("zombiepig")
+        || lower_name.contains("zombified_piglin")
+        || lower_name.contains("piglin")
+    {
+        return EntityRigKind::ZombiePiglin;
+    }
+    if lower_name.contains("witherskeleton") || lower_name.contains("wither_skeleton") {
+        return EntityRigKind::WitherSkeleton;
+    }
+    if lower_name.contains("blaze") || lower_mesh.contains("blaze") {
+        return EntityRigKind::Blaze;
+    }
+    if lower_name.contains("ghast") || lower_mesh.contains("ghast") {
+        return EntityRigKind::Ghast;
+    }
+    if lower_name.contains("magma") || lower_mesh.contains("magma") {
+        return EntityRigKind::MagmaCube;
+    }
+    if lower_name.contains("guardian") || lower_mesh.contains("guardian") {
+        return EntityRigKind::Guardian;
+    }
     if lower_name.contains("creeper") || lower_mesh.contains("creeper") {
         return EntityRigKind::Creeper;
     }
@@ -136,7 +196,6 @@ pub fn classify_entity_rig(ent: &EntityRenderSnapshot) -> EntityRigKind {
         return EntityRigKind::Llama;
     }
     if lower_name.contains("slime")
-        || lower_name.contains("magma")
         || lower_name.contains("bee")
         || lower_name.contains("bat")
         || lower_name.contains("silverfish")
@@ -172,7 +231,23 @@ pub fn classify_entity_rig(ent: &EntityRenderSnapshot) -> EntityRigKind {
 /// Canonical base PNG texture filename for Mineclonia `mobs_mc` species if Lua properties omitted one.
 pub fn canonical_mob_texture_for_entity(entity_name: &str) -> Option<&'static str> {
     let l = entity_name.to_ascii_lowercase();
-    if l.contains("mooshroom") {
+    if l.contains("pigman")
+        || l.contains("zombiepig")
+        || l.contains("zombified_piglin")
+        || l.contains("piglin")
+    {
+        Some("extra_mobs_zombified_piglin.png")
+    } else if l.contains("witherskeleton") || l.contains("wither_skeleton") {
+        Some("mobs_mc_wither_skeleton.png")
+    } else if l.contains("blaze") {
+        Some("mobs_mc_blaze.png")
+    } else if l.contains("ghast") {
+        Some("mobs_mc_ghast.png")
+    } else if l.contains("magma") {
+        Some("mobs_mc_magmacube.png")
+    } else if l.contains("guardian") {
+        Some("mobs_mc_guardian.png")
+    } else if l.contains("mooshroom") {
         Some("mobs_mc_mooshroom.png")
     } else if l.contains("cow") {
         Some("mobs_mc_cow.png")
@@ -432,6 +507,62 @@ pub fn build_falling_node_mesh(
     (verts, indices)
 }
 
+/// Build a 3D spinning, bobbing compound dropped-item mesh for `cubex:ram_mic`.
+pub fn build_dropped_ram_mic_mesh(ent: &EntityRenderSnapshot) -> (Vec<VoxelVertex>, Vec<u32>) {
+    let vm = crate::render::viewmodel::create_ram_mic_mesh();
+    let phase = (ent.id as f32 * 0.7) + ent.walk_phase;
+    let bob = 0.28 + phase.sin() * 0.055;
+    let world_mat = Mat4::from_translation(ent.pos + Vec3::new(0.0, bob, 0.0))
+        * Mat4::from_rotation_y(-ent.yaw + ent.walk_phase * 0.55)
+        * glam::Mat4::from_rotation_z(0.18)
+        * Mat4::from_scale(Vec3::splat(0.85));
+
+    let hurt = hurt_tint_for_flash(ent.hurt_flash);
+    let mut verts = Vec::with_capacity(vm.verts.len());
+    for v in &vm.verts {
+        let wp = world_mat.transform_point3(Vec3::from_array(v.pos));
+        let old_fdir = ((v.packed >> 11) & 0x7) as u8;
+        let local_n = match old_fdir {
+            0 => Vec3::X,
+            1 => Vec3::NEG_X,
+            2 => Vec3::Y,
+            3 => Vec3::NEG_Y,
+            4 => Vec3::Z,
+            _ => Vec3::NEG_Z,
+        };
+        let world_n = world_mat.transform_vector3(local_n).normalize_or_zero();
+        let new_fdir = dominant_face_dir(world_n);
+        let emissive = (v.packed & VoxelVertex::FLAG_EMISSIVE) != 0;
+        let mut packed = VoxelVertex::pack(
+            0,
+            new_fdir,
+            ent.sky_light,
+            if emissive { 15 } else { ent.block_light },
+            3,
+            false,
+            false,
+        );
+        if emissive {
+            packed |= VoxelVertex::FLAG_EMISSIVE;
+        }
+        if ent.hurt_flash > 0.01 {
+            packed |= 1u32 << 26;
+        }
+        verts.push(VoxelVertex {
+            pos: wp.to_array(),
+            uv: v.uv,
+            packed,
+            tint: [
+                ((v.tint[0] as u16 * hurt[0] as u16) / 255) as u8,
+                ((v.tint[1] as u16 * hurt[1] as u16) / 255) as u8,
+                ((v.tint[2] as u16 * hurt[2] as u16) / 255) as u8,
+                v.tint[3],
+            ],
+        });
+    }
+    (verts, vm.indices)
+}
+
 /// Build an articulated, yaw-oriented, walk-animated voxel rig mesh in world coordinates for an entity.
 pub fn build_entity_rig_mesh(
     ent: &EntityRenderSnapshot,
@@ -565,13 +696,23 @@ pub fn build_entity_rig_mesh(
                 false,
             );
         }
-        EntityRigKind::Biped => {
-            let is_skel = ent.entity_name.to_ascii_lowercase().contains("skeleton")
+        EntityRigKind::Biped
+        | EntityRigKind::ZombiePiglin
+        | EntityRigKind::WitherSkeleton => {
+            let is_wither = kind == EntityRigKind::WitherSkeleton;
+            let is_piglin = kind == EntityRigKind::ZombiePiglin;
+            let is_skel = is_wither
+                || ent.entity_name.to_ascii_lowercase().contains("skeleton")
                 || ent.entity_name.to_ascii_lowercase().contains("stray");
-            let is_zombie = ent.entity_name.to_ascii_lowercase().contains("zombie")
+            let is_zombie = is_piglin
+                || ent.entity_name.to_ascii_lowercase().contains("zombie")
                 || ent.entity_name.to_ascii_lowercase().contains("husk")
                 || ent.entity_name.to_ascii_lowercase().contains("drowned");
-            let s = (box_h / 1.9) * rel_vs_y;
+            let s = if is_wither {
+                (box_h / 1.9).max(1.22) * rel_vs_y
+            } else {
+                (box_h / 1.9) * rel_vs_y
+            };
             let p = 0.059 * s;
             let leg_top = 12.0 * p;
             let neck_y = 24.0 * p;
@@ -595,6 +736,39 @@ pub fn build_entity_rig_mesh(
                 tint,
                 solid,
             );
+            if is_piglin {
+                // Signature piglin snout + floppy ears
+                emit_box(
+                    &mut verts,
+                    &mut indices,
+                    head_mat,
+                    Vec3::new(-2.0 * p, 1.0 * p, 4.0 * p),
+                    Vec3::new(2.0 * p, 3.5 * p, 5.2 * p),
+                    uv64(32.0, 0.0, 4.0, 3.0, 1.0),
+                    sky,
+                    block,
+                    tint,
+                    solid,
+                );
+                for sx in [-4.5 * p, 3.8 * p] {
+                    let ear = head_mat
+                        * Mat4::from_translation(Vec3::new(sx, 4.0 * p, 0.0))
+                        * Mat4::from_rotation_z(if sx < 0.0 { 0.35 } else { -0.35 });
+                    emit_box(
+                        &mut verts,
+                        &mut indices,
+                        ear,
+                        Vec3::new(-0.4 * p, -3.0 * p, -1.5 * p),
+                        Vec3::new(0.4 * p, 0.5 * p, 1.5 * p),
+                        head_uv,
+                        sky,
+                        block,
+                        tint,
+                        solid,
+                    );
+                }
+            }
+
             let torso_mat = base * Mat4::from_translation(Vec3::new(0.0, leg_top, 0.0));
             emit_box(
                 &mut verts,
@@ -627,6 +801,40 @@ pub fn build_entity_rig_mesh(
                 tint,
                 solid,
             );
+            if is_piglin || is_wither {
+                let sword_tint = if is_piglin {
+                    [248, 212, 72, 255]
+                } else {
+                    [102, 100, 108, 255]
+                };
+                let sword = r_arm
+                    * Mat4::from_translation(Vec3::new(0.0, -9.2 * p, 1.5 * p))
+                    * Mat4::from_rotation_x(0.85);
+                emit_box(
+                    &mut verts,
+                    &mut indices,
+                    sword,
+                    Vec3::new(-0.55 * p, -1.0 * p, -0.55 * p),
+                    Vec3::new(0.55 * p, 10.5 * p, 0.55 * p),
+                    tile_uv,
+                    sky,
+                    block,
+                    sword_tint,
+                    true,
+                );
+                emit_box(
+                    &mut verts,
+                    &mut indices,
+                    sword,
+                    Vec3::new(-2.0 * p, 1.2 * p, -0.8 * p),
+                    Vec3::new(2.0 * p, 2.3 * p, 0.8 * p),
+                    tile_uv,
+                    sky,
+                    block,
+                    sword_tint,
+                    true,
+                );
+            }
             let l_arm = base
                 * Mat4::from_translation(Vec3::new(arm_x, neck_y - 2.0 * p, 0.0))
                 * Mat4::from_rotation_x(l_arm_pitch);
@@ -673,6 +881,271 @@ pub fn build_entity_rig_mesh(
                 tint,
                 solid,
             );
+        }
+        EntityRigKind::Blaze => {
+            let p = (box_h / 1.8).clamp(0.6, 1.5) * 0.0625 * rel_vs_y;
+            let bob = (ent.anim_time * 3.1 + ent.id as f32).sin() * 1.4 * p;
+            let head_uv = uv64(0.0, 0.0, 8.0, 8.0, 8.0);
+            let rod_uv = uv64(0.0, 16.0, 2.0, 8.0, 2.0);
+            let emissive_start = verts.len();
+
+            let head_mat = base * Mat4::from_translation(Vec3::new(0.0, 20.0 * p + bob, 0.0));
+            emit_box(
+                &mut verts,
+                &mut indices,
+                head_mat,
+                Vec3::new(-4.0 * p, -4.0 * p, -4.0 * p),
+                Vec3::new(4.0 * p, 4.0 * p, 4.0 * p),
+                head_uv,
+                sky,
+                15,
+                tint,
+                true,
+            );
+            let tiers = [
+                (21.0 * p, 9.0 * p, 1.8f32),
+                (14.0 * p, 7.0 * p, -2.5),
+                (7.5 * p, 5.0 * p, 3.2),
+            ];
+            for (tier_idx, &(ty, radius, speed)) in tiers.iter().enumerate() {
+                for r in 0..4usize {
+                    let ang = ent.anim_time * speed
+                        + (r as f32) * FRAC_PI_2
+                        + (tier_idx as f32) * 0.55;
+                    let rx = ang.cos() * radius;
+                    let rz = ang.sin() * radius;
+                    let ry = ty + (ent.anim_time * 4.0 + r as f32 + tier_idx as f32).sin() * 1.2 * p;
+                    let rod_mat = base
+                        * Mat4::from_translation(Vec3::new(rx, ry, rz))
+                        * Mat4::from_rotation_y(-ang);
+                    emit_box(
+                        &mut verts,
+                        &mut indices,
+                        rod_mat,
+                        Vec3::new(-1.0 * p, -4.0 * p, -1.0 * p),
+                        Vec3::new(1.0 * p, 4.0 * p, 1.0 * p),
+                        rod_uv,
+                        sky,
+                        15,
+                        tint,
+                        true,
+                    );
+                }
+            }
+            for v in &mut verts[emissive_start..] {
+                v.packed |= VoxelVertex::FLAG_EMISSIVE;
+            }
+        }
+        EntityRigKind::Ghast => {
+            let s = (box_h / 4.0).clamp(0.45, 1.4) * rel_vs_y;
+            let body_w = 2.0 * s;
+            let tent_w = 0.22 * s;
+            let body_uv = uv64(0.0, 0.0, 16.0, 16.0, 16.0);
+            let tent_uv = uv64(0.0, 0.0, 2.0, 8.0, 2.0);
+            let bob = (ent.anim_time * 1.8 + ent.id as f32).sin() * 0.12;
+            let g_base = base * Mat4::from_translation(Vec3::new(0.0, 0.9 * s + bob, 0.0));
+
+            emit_box(
+                &mut verts,
+                &mut indices,
+                g_base,
+                Vec3::new(-body_w, 0.0, -body_w),
+                Vec3::new(body_w, 4.0 * s, body_w),
+                body_uv,
+                sky,
+                block.max(10),
+                tint,
+                true,
+            );
+            let mut idx = 0usize;
+            for tz in [-1.25f32, 0.0, 1.25] {
+                for tx in [-1.25f32, 0.0, 1.25] {
+                    idx += 1;
+                    let tent_len = (1.1 + (idx % 3) as f32 * 0.35) * s;
+                    let sway_x = (ent.anim_time * 3.1 + idx as f32 * 0.85).sin() * 0.28;
+                    let sway_z = (ent.anim_time * 2.5 + idx as f32 * 1.1).cos() * 0.18;
+                    let tmat = g_base
+                        * Mat4::from_translation(Vec3::new(tx * s, 0.0, tz * s))
+                        * Mat4::from_rotation_x(sway_x)
+                        * Mat4::from_rotation_z(sway_z);
+                    emit_box(
+                        &mut verts,
+                        &mut indices,
+                        tmat,
+                        Vec3::new(-tent_w, -tent_len, -tent_w),
+                        Vec3::new(tent_w, 0.05, tent_w),
+                        tent_uv,
+                        sky,
+                        block.max(10),
+                        tint,
+                        true,
+                    );
+                }
+            }
+        }
+        EntityRigKind::MagmaCube => {
+            let half_w = ((ent.collisionbox[3] - ent.collisionbox[0]).abs() * 0.5).clamp(0.24, 1.4);
+            let h = box_h * rel_vs_y;
+            let jump_lift = (ent.vel_y.max(0.0) * 0.055).clamp(0.0, 0.28);
+            let shell_uv = uv128(0.0, 0.0, 16.0, 16.0, 16.0);
+            let core_uv = uv128(0.0, 32.0, 8.0, 8.0, 8.0);
+
+            let core_start = verts.len();
+            emit_box(
+                &mut verts,
+                &mut indices,
+                base,
+                Vec3::new(-half_w * 0.52, h * 0.22, -half_w * 0.52),
+                Vec3::new(half_w * 0.52, h * 0.78 + jump_lift * 4.0, half_w * 0.52),
+                core_uv,
+                sky,
+                15,
+                tint,
+                true,
+            );
+            for v in &mut verts[core_start..] {
+                v.packed |= VoxelVertex::FLAG_EMISSIVE;
+            }
+            let slice_h = h / 8.0;
+            for slice in 0..8usize {
+                let y0 = slice as f32 * (slice_h + jump_lift);
+                let y1 = y0 + slice_h * 0.96;
+                emit_box(
+                    &mut verts,
+                    &mut indices,
+                    base,
+                    Vec3::new(-half_w, y0, -half_w),
+                    Vec3::new(half_w, y1, half_w),
+                    shell_uv,
+                    sky,
+                    12,
+                    tint,
+                    true,
+                );
+            }
+        }
+        EntityRigKind::Guardian => {
+            let r = (box_h * 0.5).clamp(0.32, 0.85) * rel_vs_y;
+            let body_uv = uv64(0.0, 0.0, 12.0, 12.0, 12.0);
+            let eye_uv = uv64(8.0, 0.0, 4.0, 4.0, 1.0);
+            let tail_uv = uv64(40.0, 0.0, 4.0, 4.0, 8.0);
+            let spike_uv = uv64(0.0, 0.0, 2.0, 4.0, 2.0);
+            let swim_bob = (ent.anim_time * 2.6 + ent.id as f32).sin() * 0.06;
+            let g_base = base * Mat4::from_translation(Vec3::new(0.0, r + swim_bob, 0.0));
+
+            emit_box(
+                &mut verts,
+                &mut indices,
+                g_base,
+                Vec3::new(-r, -r, -r),
+                Vec3::new(r, r, r),
+                body_uv,
+                sky,
+                block.max(6),
+                tint,
+                true,
+            );
+            let eye_start = verts.len();
+            emit_box(
+                &mut verts,
+                &mut indices,
+                g_base,
+                Vec3::new(-r * 0.34, -r * 0.34, r * 0.92),
+                Vec3::new(r * 0.34, r * 0.34, r * 1.05),
+                eye_uv,
+                sky,
+                15,
+                tint,
+                true,
+            );
+            for v in &mut verts[eye_start..] {
+                v.packed |= VoxelVertex::FLAG_EMISSIVE;
+            }
+            let ext = 0.28 * r + 0.08 * r * (ent.anim_time * 4.5).sin().abs();
+            let spike_dirs = [
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(0.0, 1.0, -1.0),
+                Vec3::new(0.0, -1.0, 1.0),
+                Vec3::new(0.0, -1.0, -1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(-1.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, -1.0),
+                Vec3::new(-1.0, 0.0, -1.0),
+            ];
+            for d in spike_dirs {
+                let c = d.normalize() * (r + ext * 0.5);
+                let sp_half = Vec3::splat(r * 0.12) + d.abs() * (ext * 0.55);
+                emit_box(
+                    &mut verts,
+                    &mut indices,
+                    g_base,
+                    c - sp_half,
+                    c + sp_half,
+                    spike_uv,
+                    sky,
+                    block.max(6),
+                    tint,
+                    true,
+                );
+            }
+            let tail_wag = (ent.anim_time * 5.2 + ent.id as f32).sin() * 0.32;
+            let mut t_mat = g_base * Mat4::from_translation(Vec3::new(0.0, 0.0, -r));
+            for seg in 0..3usize {
+                let len = r * (0.62 - seg as f32 * 0.12);
+                let w = r * (0.34 - seg as f32 * 0.07);
+                t_mat = t_mat * Mat4::from_rotation_y(tail_wag * (0.5 + seg as f32 * 0.35));
+                emit_box(
+                    &mut verts,
+                    &mut indices,
+                    t_mat,
+                    Vec3::new(-w, -w, -len),
+                    Vec3::new(w, w, 0.0),
+                    tail_uv,
+                    sky,
+                    block.max(6),
+                    tint,
+                    true,
+                );
+                t_mat = t_mat * Mat4::from_translation(Vec3::new(0.0, 0.0, -len));
+            }
+        }
+        EntityRigKind::Fireball => {
+            let r = ((ent.collisionbox[3] - ent.collisionbox[0]).abs() * 0.5).clamp(0.16, 0.55);
+            let spin = Mat4::from_translation(ent.pos)
+                * Mat4::from_rotation_y(ent.anim_time * 4.2)
+                * Mat4::from_rotation_x(ent.anim_time * 3.1);
+            let start = verts.len();
+            emit_box(
+                &mut verts,
+                &mut indices,
+                spin,
+                Vec3::splat(-r),
+                Vec3::splat(r),
+                tile_uv,
+                15,
+                15,
+                [255, 195, 70, 255],
+                true,
+            );
+            emit_box(
+                &mut verts,
+                &mut indices,
+                spin * Mat4::from_rotation_y(0.78),
+                Vec3::splat(-r * 0.72),
+                Vec3::splat(r * 0.72),
+                tile_uv,
+                15,
+                15,
+                [255, 245, 165, 255],
+                true,
+            );
+            for v in &mut verts[start..] {
+                v.packed |= VoxelVertex::FLAG_EMISSIVE;
+            }
         }
         EntityRigKind::Cow => {
             let p = (box_h / 1.4).clamp(0.55, 1.8) * 0.0625 * rel_vs_y;
@@ -1296,7 +1769,25 @@ pub fn build_entity_rig_mesh(
 /// Synthesize a crisp 16x16 textured fallback mob skin when an entity's texture file is absent.
 pub fn make_fallback_mob_texture(entity_name: &str) -> RgbaImage {
     let lower = entity_name.to_ascii_lowercase();
-    let (base, accent): ([u8; 4], [u8; 4]) = if lower.contains("zombie") || lower.contains("creeper") || lower.contains("slime") {
+    let (base, accent): ([u8; 4], [u8; 4]) = if lower.contains("fireball") {
+        ([255, 165, 36, 255], [255, 238, 128, 255])
+    } else if lower.contains("blaze") {
+        ([244, 176, 36, 255], [255, 240, 120, 255])
+    } else if lower.contains("ghast") {
+        ([242, 242, 244, 255], [190, 56, 56, 255])
+    } else if lower.contains("witherskeleton") || lower.contains("wither_skeleton") {
+        ([44, 42, 46, 255], [160, 158, 164, 255])
+    } else if lower.contains("magma") {
+        ([54, 26, 20, 255], [255, 154, 24, 255])
+    } else if lower.contains("guardian") {
+        ([82, 162, 146, 255], [238, 142, 74, 255])
+    } else if lower.contains("pigman")
+        || lower.contains("zombiepig")
+        || lower.contains("zombified_piglin")
+        || lower.contains("piglin")
+    {
+        ([188, 124, 124, 255], [92, 142, 66, 255])
+    } else if lower.contains("zombie") || lower.contains("creeper") || lower.contains("slime") {
         ([76, 138, 66, 255], [46, 92, 42, 255])
     } else if lower.contains("skeleton") {
         ([214, 214, 206, 255], [142, 142, 136, 255])
@@ -1357,6 +1848,8 @@ mod tests {
             wield_item: String::new(),
             walk_phase: 0.5,
             walk_blend: 1.0,
+            anim_time: 0.5,
+            vel_y: 0.0,
             hurt_flash: 0.0,
             sky_light: 15,
             block_light: 0,
@@ -1481,6 +1974,8 @@ mod tests {
             wield_item: String::new(),
             walk_phase: 0.0,
             walk_blend: 0.0,
+            anim_time: 0.0,
+            vel_y: 0.0,
             hurt_flash: 0.0,
             sky_light: 15,
             block_light: 0,
@@ -1504,5 +1999,68 @@ mod tests {
         assert!(verts.iter().all(|v| ((v.packed >> 27) & 1) == 0));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dropped_ram_mic_uses_compound_3d_mesh_with_emissive_led() {
+        let ent = EntityRenderSnapshot {
+            id: 77,
+            entity_name: "__builtin:item".into(),
+            pos: Vec3::new(4.0, 10.0, 4.0),
+            yaw: 0.25,
+            collisionbox: [-0.18, -0.18, -0.18, 0.18, 0.18, 0.18],
+            visual: "wielditem".into(),
+            visual_size: Vec3::splat(0.67),
+            mesh: String::new(),
+            texture_name: String::new(),
+            wield_item: crate::registry::RAM_MIC_ITEM_ID.into(),
+            walk_phase: 0.4,
+            walk_blend: 0.0,
+            anim_time: 0.4,
+            vel_y: 0.0,
+            hurt_flash: 0.0,
+            sky_light: 14,
+            block_light: 0,
+        };
+        assert_eq!(classify_entity_rig(&ent), EntityRigKind::DroppedItem);
+
+        let (verts, indices) = build_dropped_ram_mic_mesh(&ent);
+        assert!(
+            verts.len() > 240,
+            "Dropped cubex:ram_mic must use full 3D compound mesh, got {} verts",
+            verts.len()
+        );
+        assert!(indices.len() > 360);
+        assert!(verts
+            .iter()
+            .any(|v| (v.packed & VoxelVertex::FLAG_EMISSIVE) != 0));
+    }
+
+    #[test]
+    fn nether_and_monument_mobs_build_valid_3d_voxel_meshes() {
+        let species = [
+            ("mobs_mc:pigman", [-0.3, 0.0, -0.3, 0.3, 1.95, 0.3], EntityRigKind::ZombiePiglin, 64, 64),
+            ("mobs_mc:witherskeleton", [-0.35, 0.0, -0.35, 0.35, 2.4, 0.35], EntityRigKind::WitherSkeleton, 64, 32),
+            ("mobs_mc:blaze", [-0.35, 0.0, -0.35, 0.35, 1.8, 0.35], EntityRigKind::Blaze, 64, 32),
+            ("mobs_mc:ghast", [-1.9, 0.0, -1.9, 1.9, 4.0, 1.9], EntityRigKind::Ghast, 64, 32),
+            ("mobs_mc:magma_cube", [-0.8, 0.0, -0.8, 0.8, 1.6, 0.8], EntityRigKind::MagmaCube, 128, 64),
+            ("mobs_mc:guardian", [-0.45, 0.0, -0.45, 0.45, 0.9, 0.45], EntityRigKind::Guardian, 64, 64),
+            ("cubex:fireball", [-0.25, -0.25, -0.25, 0.25, 0.25, 0.25], EntityRigKind::Fireball, 16, 16),
+        ];
+        for (name, cbox, expected_kind, tw, th) in species {
+            let mut mob = mk_mob(name, cbox);
+            mob.anim_time = 1.25;
+            mob.vel_y = 2.0;
+            assert_eq!(classify_entity_rig(&mob), expected_kind, "species={name}");
+            let (verts, idx) = build_entity_rig_mesh(&mob, tw, th);
+            assert!(
+                !verts.is_empty() && idx.len() % 6 == 0,
+                "Expected valid indexed mesh for {name}"
+            );
+            assert!(verts.iter().all(|v| ((v.packed >> 27) & 1) == 1));
+            assert!(verts
+                .iter()
+                .all(|v| v.uv[0] >= 0.0 && v.uv[0] <= 1.0 && v.uv[1] >= 0.0 && v.uv[1] <= 1.0));
+        }
     }
 }

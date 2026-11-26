@@ -22,6 +22,7 @@ pub struct PlayerModelState {
     pub is_sneaking: bool,
     pub held_item: Option<String>,
     pub is_swinging: bool,
+    pub skin_id: String,
 }
 
 impl Default for PlayerModelState {
@@ -42,6 +43,7 @@ impl PlayerModelState {
             is_sneaking: false,
             held_item: None,
             is_swinging: false,
+            skin_id: "default".into(),
         }
     }
 
@@ -127,12 +129,17 @@ pub struct PlayerPartCounts {
     pub left_leg_verts: usize,
     pub right_leg_verts: usize,
     pub overlay_verts: usize,
+    pub hair_crown_verts: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct PlayerModelMesh {
     pub body_verts: Vec<VoxelVertex>,
     pub body_indices: Vec<u32>,
+    pub overlay_verts: Vec<VoxelVertex>,
+    pub overlay_indices: Vec<u32>,
+    pub crown_verts: Vec<VoxelVertex>,
+    pub crown_indices: Vec<u32>,
     pub held_verts: Vec<VoxelVertex>,
     pub held_indices: Vec<u32>,
     pub held_texture: Option<RgbaImage>,
@@ -259,7 +266,67 @@ fn emit_part_box(
     verts.len() - start_verts
 }
 
-/// Build an articulated 6-part UV-mapped 3D character mesh (plus optional overlays & held item)
+/// Rich espresso-brown sRGB palette (`#1E1511`, `#2C1F19`, `#3E2C23`) for CarterPCs 3D curly crown.
+pub const CARTER_HAIR_PALETTE: [[u8; 4]; 3] = [
+    [0x1E, 0x15, 0x11, 255],
+    [0x2C, 0x1F, 0x19, 255],
+    [0x3E, 0x2C, 0x23, 255],
+];
+
+/// Build a 3x1 sRGB palette texture so GPU sampling preserves deep espresso tones on sRGB swapchains.
+pub fn carter_hair_palette_image() -> RgbaImage {
+    let mut img = RgbaImage::new(CARTER_HAIR_PALETTE.len() as u32, 1);
+    for (i, col) in CARTER_HAIR_PALETTE.iter().enumerate() {
+        img.put_pixel(i as u32, 0, image::Rgba(*col));
+    }
+    img
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_palette_part_box(
+    verts: &mut Vec<VoxelVertex>,
+    indices: &mut Vec<u32>,
+    transform: Mat4,
+    min: Vec3,
+    max: Vec3,
+    shade_idx: usize,
+    sky: u8,
+    block: u8,
+) -> usize {
+    let start_verts = verts.len();
+    let [x0, y0, z0] = min.to_array();
+    let [x1, y1, z1] = max.to_array();
+    let faces: [(Vec3, [[f32; 3]; 4]); 6] = [
+        (Vec3::X, [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]]),
+        (Vec3::NEG_X, [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]]),
+        (Vec3::Y, [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]]),
+        (Vec3::NEG_Y, [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]]),
+        (Vec3::Z, [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]]),
+        (Vec3::NEG_Z, [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]]),
+    ];
+    let u = (shade_idx.min(CARTER_HAIR_PALETTE.len() - 1) as f32 + 0.5)
+        / CARTER_HAIR_PALETTE.len() as f32;
+    let uv = [u, 0.5f32];
+    for (local_n, pts) in faces {
+        let world_n = transform.transform_vector3(local_n).normalize_or_zero();
+        let fdir = dominant_face_dir(world_n);
+        let packed = VoxelVertex::pack(0, fdir, sky, block, 3, false, false);
+        let base = verts.len() as u32;
+        for p in pts {
+            let wp = transform.transform_point3(Vec3::from_array(p));
+            verts.push(VoxelVertex {
+                pos: wp.to_array(),
+                uv,
+                packed,
+                tint: [255, 255, 255, 255],
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    verts.len() - start_verts
+}
+
+/// Build an articulated 6-part UV-mapped 3D character mesh (plus optional overlays, crown & held item)
 /// with feet at `pos.y`, eye at `pos.y + 1.625`, and top at `pos.y + 1.80`.
 pub fn build_player_model_vertices(
     state: &PlayerModelState,
@@ -288,8 +355,12 @@ pub fn build_player_model_vertices_lit(
     let tex_w = 64.0f32;
     let tex_h = if is_64 { 64.0f32 } else { 32.0f32 };
 
-    let mut body_verts = Vec::with_capacity(288);
-    let mut body_indices = Vec::with_capacity(432);
+    let mut body_verts = Vec::with_capacity(160);
+    let mut body_indices = Vec::with_capacity(240);
+    let mut overlay_verts = Vec::with_capacity(144);
+    let mut overlay_indices = Vec::with_capacity(216);
+    let mut crown_verts = Vec::new();
+    let mut crown_indices = Vec::new();
     let mut counts = PlayerPartCounts::default();
 
     // Root world placement (local +Z aligns with look_dir = (-sin(yaw), 0, cos(yaw)))
@@ -497,13 +568,13 @@ pub fn build_player_model_vertices_lit(
         false,
     );
 
-    // Hat overlay (present in both 64x32 and 64x64 at UV (32, 0), alpha-cutout)
+    // Hat / Hair outer overlay (1.125x expanded shell around 8x8x8 head, UV (32, 0) = u 0.5..1.0, v 0.0..0.5)
     counts.overlay_verts += emit_part_box(
-        &mut body_verts,
-        &mut body_indices,
+        &mut overlay_verts,
+        &mut overlay_indices,
         head_mat,
-        Vec3::new(-4.45 * p, -0.45 * p, -4.45 * p),
-        Vec3::new(4.45 * p, 8.45 * p, 4.45 * p),
+        Vec3::new(-4.5 * p, -0.5 * p, -4.5 * p),
+        Vec3::new(4.5 * p, 8.5 * p, 4.5 * p),
         BoxUvSpec {
             ox: 32.0,
             oy: 0.0,
@@ -516,15 +587,66 @@ pub fn build_player_model_vertices_lit(
         tex_h,
         sky,
         block,
-        true,
+        false,
     );
+
+    // Sculpted 3D curly hair crown: 20 dome curl cubes (0.11..0.16 blocks, y=+0.46..+0.62)
+    // plus 5 subtle top-edge forehead curl tips (y=+0.34..+0.42) leaving eyebrows & eyes uncovered.
+    if crate::textures::is_carterpcs_skin(&state.skin_id) {
+        // (center_xyz, size_xyz, shade_idx) in head_mat local block coordinates
+        const CURLS: [([f32; 3], [f32; 3], usize); 25] = [
+            // Outer perimeter dome ring (10 staggered curls, y bottom ~0.43..0.46 into top ~0.55..0.58)
+            ([-0.165, 0.500, -0.165], [0.145, 0.130, 0.140], 0),
+            ([0.000, 0.510, -0.175], [0.155, 0.140, 0.140], 1),
+            ([0.165, 0.500, -0.165], [0.145, 0.130, 0.140], 2),
+            ([-0.185, 0.498, -0.045], [0.135, 0.125, 0.130], 1),
+            ([-0.180, 0.492, 0.080], [0.125, 0.120, 0.130], 2),
+            ([0.185, 0.498, -0.045], [0.135, 0.125, 0.130], 0),
+            ([0.180, 0.492, 0.080], [0.125, 0.120, 0.130], 1),
+            ([-0.130, 0.498, 0.165], [0.125, 0.118, 0.118], 0),
+            ([0.000, 0.505, 0.175], [0.145, 0.128, 0.116], 2),
+            ([0.130, 0.498, 0.165], [0.125, 0.118, 0.118], 1),
+            // Mid-crown staggered dome ring (6 curls, y top ~0.58..0.605)
+            ([-0.105, 0.532, -0.105], [0.150, 0.138, 0.150], 2),
+            ([0.020, 0.542, -0.115], [0.160, 0.140, 0.140], 0),
+            ([0.115, 0.532, -0.090], [0.140, 0.130, 0.140], 1),
+            ([-0.115, 0.528, 0.040], [0.140, 0.130, 0.145], 0),
+            ([0.110, 0.528, 0.048], [0.148, 0.130, 0.140], 2),
+            ([-0.010, 0.534, 0.108], [0.150, 0.130, 0.130], 1),
+            // Top dome apex cluster (4 curls, rising to y=0.62)
+            ([-0.058, 0.548, -0.038], [0.130, 0.138, 0.130], 1),
+            ([0.058, 0.550, -0.028], [0.140, 0.132, 0.138], 2),
+            ([-0.040, 0.548, 0.058], [0.120, 0.132, 0.120], 0),
+            ([0.040, 0.552, 0.038], [0.130, 0.136, 0.128], 1),
+            // 5 tiny subtle curl tips along upper forehead hairline (y strictly 0.345..0.417)
+            ([-0.175, 0.376, 0.228], [0.070, 0.058, 0.056], 0),
+            ([-0.090, 0.382, 0.234], [0.068, 0.056, 0.056], 2),
+            ([0.005, 0.386, 0.236], [0.072, 0.060, 0.056], 1),
+            ([0.095, 0.378, 0.232], [0.066, 0.054, 0.054], 0),
+            ([0.176, 0.382, 0.226], [0.070, 0.056, 0.056], 2),
+        ];
+        for (center, size, shade) in CURLS {
+            let c = Vec3::from_array(center);
+            let half = Vec3::from_array(size) * 0.5;
+            counts.hair_crown_verts += emit_palette_part_box(
+                &mut crown_verts,
+                &mut crown_indices,
+                head_mat,
+                c - half,
+                c + half,
+                shade,
+                sky,
+                block,
+            );
+        }
+    }
 
     // 64x64 second-layer overlays (Jacket, Left/Right Sleeves, Left/Right Pants)
     if is_64 {
         let ov = 0.25 * p;
         counts.overlay_verts += emit_part_box(
-            &mut body_verts,
-            &mut body_indices,
+            &mut overlay_verts,
+            &mut overlay_indices,
             torso_mat,
             Vec3::new(-4.0 * p - ov, -ov, -2.0 * p - ov),
             Vec3::new(4.0 * p + ov, 12.0 * p + ov, 2.0 * p + ov),
@@ -540,11 +662,11 @@ pub fn build_player_model_vertices_lit(
             tex_h,
             sky,
             block,
-            true,
+            false,
         );
         counts.overlay_verts += emit_part_box(
-            &mut body_verts,
-            &mut body_indices,
+            &mut overlay_verts,
+            &mut overlay_indices,
             r_arm_mat,
             Vec3::new(-2.0 * p - ov, -10.0 * p - ov, -2.0 * p - ov),
             Vec3::new(2.0 * p + ov, 2.0 * p + ov, 2.0 * p + ov),
@@ -560,11 +682,11 @@ pub fn build_player_model_vertices_lit(
             tex_h,
             sky,
             block,
-            true,
+            false,
         );
         counts.overlay_verts += emit_part_box(
-            &mut body_verts,
-            &mut body_indices,
+            &mut overlay_verts,
+            &mut overlay_indices,
             l_arm_mat,
             Vec3::new(-2.0 * p - ov, -10.0 * p - ov, -2.0 * p - ov),
             Vec3::new(2.0 * p + ov, 2.0 * p + ov, 2.0 * p + ov),
@@ -580,11 +702,11 @@ pub fn build_player_model_vertices_lit(
             tex_h,
             sky,
             block,
-            true,
+            false,
         );
         counts.overlay_verts += emit_part_box(
-            &mut body_verts,
-            &mut body_indices,
+            &mut overlay_verts,
+            &mut overlay_indices,
             r_leg_mat,
             Vec3::new(-2.0 * p - ov, -12.0 * p - ov, -2.0 * p - ov),
             Vec3::new(2.0 * p + ov, ov, 2.0 * p + ov),
@@ -600,11 +722,11 @@ pub fn build_player_model_vertices_lit(
             tex_h,
             sky,
             block,
-            true,
+            false,
         );
         counts.overlay_verts += emit_part_box(
-            &mut body_verts,
-            &mut body_indices,
+            &mut overlay_verts,
+            &mut overlay_indices,
             l_leg_mat,
             Vec3::new(-2.0 * p - ov, -12.0 * p - ov, -2.0 * p - ov),
             Vec3::new(2.0 * p + ov, ov, 2.0 * p + ov),
@@ -620,7 +742,7 @@ pub fn build_player_model_vertices_lit(
             tex_h,
             sky,
             block,
-            true,
+            false,
         );
     }
 
@@ -634,7 +756,13 @@ pub fn build_player_model_vertices_lit(
         if !item_key.is_empty() {
             let vm = build_viewmodel_mesh(Some(item_key), registries, atlas);
             if !vm.is_arm && !vm.verts.is_empty() && !vm.indices.is_empty() {
-                let item_local = if vm.is_node_block {
+                let item_local = if vm.is_custom_prop {
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::splat(0.92),
+                        Quat::from_euler(EulerRot::YXZ, 0.25, -0.35, 0.0),
+                        Vec3::new(0.0, -9.0 * p, 3.0 * p),
+                    )
+                } else if vm.is_node_block {
                     Mat4::from_scale_rotation_translation(
                         Vec3::splat(0.32),
                         Quat::from_euler(EulerRot::YXZ, 0.45, 0.25, 0.0),
@@ -664,7 +792,19 @@ pub fn build_player_model_vertices_lit(
                     let world_n = item_world.transform_vector3(local_n).normalize_or_zero();
                     let new_fdir = dominant_face_dir(world_n);
                     let cutout = ((v.packed >> 25) & 0x1) != 0;
-                    let packed = VoxelVertex::pack(layer, new_fdir, sky, block, 3, false, cutout);
+                    let emissive = (v.packed & VoxelVertex::FLAG_EMISSIVE) != 0;
+                    let mut packed = VoxelVertex::pack(
+                        layer,
+                        new_fdir,
+                        sky,
+                        if emissive { 15 } else { block },
+                        3,
+                        false,
+                        cutout,
+                    );
+                    if emissive {
+                        packed |= VoxelVertex::FLAG_EMISSIVE;
+                    }
                     held_verts.push(VoxelVertex {
                         pos: wp.to_array(),
                         uv: v.uv,
@@ -681,6 +821,10 @@ pub fn build_player_model_vertices_lit(
     PlayerModelMesh {
         body_verts,
         body_indices,
+        overlay_verts,
+        overlay_indices,
+        crown_verts,
+        crown_indices,
         held_verts,
         held_indices,
         held_texture,
@@ -790,5 +934,103 @@ mod tests {
         state.swing_progress = 0.5;
         let swinging = build_player_model_vertices(&state, Vec3::ZERO, 64, 32, &reg, &atlas);
         assert_ne!(rest.body_verts[48..72][0].pos, swinging.body_verts[48..72][0].pos);
+    }
+
+    #[test]
+    fn carterpcs_head_overlay_1_125x_curly_hair_crown_and_ram_mic() {
+        let reg = EngineRegistries::new();
+        let atlas = TextureAtlas::placeholder();
+
+        let mut state = PlayerModelState::default();
+        state.skin_id = "carterpcs.png".into();
+        state.held_item = Some(crate::registry::RAM_MIC_ITEM_ID.into());
+
+        let mesh = build_player_model_vertices(&state, Vec3::ZERO, 128, 64, &reg, &atlas);
+        assert_eq!(mesh.part_counts.overlay_verts, 24);
+        assert_eq!(mesh.overlay_verts.len(), 24);
+        assert_eq!(mesh.part_counts.hair_crown_verts, 25 * 24);
+        assert_eq!(mesh.crown_verts.len(), 25 * 24);
+        assert_eq!(mesh.crown_indices.len(), 25 * 36);
+        assert!(!mesh.held_verts.is_empty());
+        assert!(!mesh.held_indices.is_empty());
+
+        // Check espresso sRGB palette & head-clearance vertical bounds (eyebrows/eyes stay uncovered)
+        assert_eq!(
+            CARTER_HAIR_PALETTE,
+            [[0x1E, 0x15, 0x11, 255], [0x2C, 0x1F, 0x19, 255], [0x3E, 0x2C, 0x23, 255]]
+        );
+        let hair_tex = carter_hair_palette_image();
+        assert_eq!(hair_tex.dimensions(), (3, 1));
+        let neck_y = 24.0 * PIXEL_SCALE;
+        let crown_min_y = mesh
+            .crown_verts
+            .iter()
+            .map(|v| v.pos[1] - neck_y)
+            .fold(f32::INFINITY, f32::min);
+        let crown_max_y = mesh
+            .crown_verts
+            .iter()
+            .map(|v| v.pos[1] - neck_y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            crown_min_y >= 0.34 - 1e-4,
+            "Hairline curls must stay above eyebrows (y >= 0.34), got min_y={crown_min_y}"
+        );
+        assert!(
+            (0.60..=0.63).contains(&crown_max_y),
+            "Dome top must reach ~0.62 above head base, got max_y={crown_max_y}"
+        );
+
+        let (mut min_v, mut max_v) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for v in &mesh.overlay_verts {
+            let p = Vec3::from_array(v.pos);
+            min_v = min_v.min(p);
+            max_v = max_v.max(p);
+            assert!(
+                v.uv[0] >= 0.5 - 1e-4 && v.uv[0] <= 1.0 + 1e-4,
+                "Head overlay U must lie in [0.5, 1.0], got {}",
+                v.uv[0]
+            );
+            assert!(
+                v.uv[1] >= -1e-4 && v.uv[1] <= 0.5 + 1e-4,
+                "Head overlay V must lie in [0.0, 0.5], got {}",
+                v.uv[1]
+            );
+        }
+        let span = max_v - min_v;
+        let expected_span = 9.0 * PIXEL_SCALE;
+        assert!((span.x - expected_span).abs() < 1e-4, "span.x={}", span.x);
+        assert!((span.y - expected_span).abs() < 1e-4, "span.y={}", span.y);
+        assert!((span.z - expected_span).abs() < 1e-4, "span.z={}", span.z);
+
+        let mut default_state = PlayerModelState::default();
+        default_state.skin_id = "default".into();
+        let default_mesh =
+            build_player_model_vertices(&default_state, Vec3::ZERO, 64, 32, &reg, &atlas);
+        assert!(default_mesh.crown_verts.is_empty());
+
+        let vm = crate::render::viewmodel::build_viewmodel_mesh(
+            Some(crate::registry::RAM_MIC_ITEM_ID),
+            &reg,
+            &atlas,
+        );
+        assert!(vm.is_custom_prop);
+        assert!(!vm.verts.is_empty());
+        assert_eq!(vm.texture.as_ref().map(|t| t.dimensions()), Some((8, 1)));
+        assert!(
+            vm.verts
+                .iter()
+                .any(|v| (v.packed & crate::render::mesher::VoxelVertex::FLAG_EMISSIVE) != 0),
+            "RAM mic prop must include emissive status LED vertices"
+        );
+        let pcb_verts = &vm.verts[0..24];
+        let pmin = pcb_verts
+            .iter()
+            .fold(Vec3::splat(f32::INFINITY), |a, v| a.min(Vec3::from_array(v.pos)));
+        let pmax = pcb_verts
+            .iter()
+            .fold(Vec3::splat(f32::NEG_INFINITY), |a, v| a.max(Vec3::from_array(v.pos)));
+        let pspan = pmax - pmin;
+        assert!((pspan.x - 0.15).abs() < 1e-4 && (pspan.y - 0.52).abs() < 1e-4 && (pspan.z - 0.035).abs() < 1e-4);
     }
 }

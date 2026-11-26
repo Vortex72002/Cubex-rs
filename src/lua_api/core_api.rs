@@ -1326,6 +1326,7 @@ pub fn register_core_api(lua: &Lua, shared: Arc<LuaEngineShared>) -> LuaResult<(
                     .get::<Value>("drop")
                     .map(parse_node_drop)
                     .unwrap_or(NodeDrop::Default);
+                let safe_terrain = crate::registry::is_safe_terrain_node(&name, &groups);
 
                 let nd = NodeDef {
                     id: 0,
@@ -1385,7 +1386,11 @@ pub fn register_core_api(lua: &Lua, shared: Arc<LuaEngineShared>) -> LuaResult<(
                     liquid_alternative_flowing: def.get("liquid_alternative_flowing").unwrap_or_default(),
                     liquid_alternative_source: def.get("liquid_alternative_source").unwrap_or_default(),
                     floodable: def.get("floodable").unwrap_or(false),
-                    damage_per_second: def.get("damage_per_second").unwrap_or(0),
+                    damage_per_second: if safe_terrain {
+                        0
+                    } else {
+                        def.get("damage_per_second").unwrap_or(0)
+                    },
                     waving: def.get("waving").unwrap_or(0),
                     leveled: def.get("leveled").unwrap_or(0),
                     visual_scale: def.get("visual_scale").unwrap_or(1.0),

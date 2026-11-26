@@ -1000,11 +1000,10 @@ pub fn paint_player_skin_card(
     let px = 4.0f32; // pixel scale
 
     if let Some(tex) = skin {
-        // Standard 64x64 (or 64x32) Steve skin front UVs:
-        // Head: (8,8)-(16,16), Torso: (20,20)-(28,32), ArmR: (44,20)-(48,32), LegR: (4,20)-(8,32)
+        // Standard Minecraft skin layout supports 64x32 (and 2:1 HD 128x64) and 64x64 (1:1 HD 128x128)
         let sz = tex.size();
-        let tw = sz[0].max(1) as f32;
-        let th = sz[1].max(1) as f32;
+        let tw = 64.0f32;
+        let th = if sz[0] > 0 && sz[1] >= sz[0] { 64.0 } else { 32.0 };
         let uv_box = |x0: f32, y0: f32, x1: f32, y1: f32| {
             Rect::from_min_max(Pos2::new(x0 / tw, y0 / th), Pos2::new(x1 / tw, y1 / th))
         };

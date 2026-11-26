@@ -47,6 +47,43 @@ pub struct MoveInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageSource {
+    Fall,
+    Suffocation,
+    NodeDamage,
+    Starvation,
+    Mob,
+    Wither,
+}
+
+pub fn log_player_damage(
+    source: DamageSource,
+    damage: i32,
+    old_hp: i32,
+    new_hp: i32,
+    pos: Vec3,
+    detail: &str,
+) {
+    if new_hp < old_hp {
+        tracing::warn!(
+            source = ?source,
+            damage,
+            old_hp,
+            new_hp,
+            x = pos.x,
+            y = pos.y,
+            z = pos.z,
+            detail,
+            "Player took damage"
+        );
+        eprintln!(
+            "[Cubex Damage] source={source:?} dmg={damage} hp={old_hp}->{new_hp} pos=({:.2}, {:.2}, {:.2}) ({detail})",
+            pos.x, pos.y, pos.z
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FallEvent {
     pub damage: i32,
     pub node_id: u16,
@@ -57,6 +94,7 @@ pub struct StepEvents {
     pub fall: Option<FallEvent>,
     pub footstep_node: Option<u16>,
     pub regains_ground: bool,
+    pub wither_damaged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1010,17 +1048,28 @@ pub struct PlayerController {
     pub death_cause: String,
     pub spawn_invuln_timer: f32,
     pub suffocation_timer: f32,
+    pub wither_timer: f32,
+    pub wither_tick_accum: f32,
     pub saturation: f32,
     pub exhaustion: f32,
     pub regen_timer: f32,
     pub starve_timer: f32,
     pub eat_cooldown: f32,
+    pub airborne_time: f32,
+    pub fall_tracking: bool,
+    pub fall_start_y: f32,
+    pub fall_distance: f32,
+    pub dimension: crate::world::DimensionId,
+    pub portal_charge: f32,
+    pub portal_cooldown: f32,
+    pub portal_warp_flash: f32,
 
     prev_jump: bool,
     prev_forward: bool,
     last_w_down: Option<Instant>,
     double_tap_sprint: bool,
     max_fall_speed: f32,
+    peak_air_y: Option<f32>,
     disable_jump: bool,
 }
 
@@ -1055,16 +1104,27 @@ impl Default for PlayerController {
             death_cause: String::new(),
             spawn_invuln_timer: 0.0,
             suffocation_timer: 0.0,
+            wither_timer: 0.0,
+            wither_tick_accum: 0.0,
             saturation: 5.0,
             exhaustion: 0.0,
             regen_timer: 0.0,
             starve_timer: 0.0,
             eat_cooldown: 0.0,
+            airborne_time: 0.0,
+            fall_tracking: false,
+            fall_start_y: 24.0,
+            fall_distance: 0.0,
+            dimension: crate::world::DimensionId::Overworld,
+            portal_charge: 0.0,
+            portal_cooldown: 0.0,
+            portal_warp_flash: 0.0,
             prev_jump: false,
             prev_forward: false,
             last_w_down: None,
             double_tap_sprint: false,
             max_fall_speed: 0.0,
+            peak_air_y: None,
             disable_jump: false,
         }
     }
@@ -1092,6 +1152,22 @@ impl PlayerController {
 
     pub fn eye_pos(&self) -> Vec3 {
         self.pos + Vec3::new(0.0, self.eye_height, 0.0)
+    }
+
+    pub fn reset_fall_state(&mut self) {
+        self.airborne_time = 0.0;
+        self.fall_tracking = false;
+        self.fall_distance = 0.0;
+        self.fall_start_y = self.pos.y;
+        self.peak_air_y = None;
+        self.max_fall_speed = 0.0;
+    }
+
+    pub fn apply_wither(&mut self, duration_secs: f32) {
+        if self.gamemode != GameMode::Survival || self.is_dead || duration_secs <= 0.0 {
+            return;
+        }
+        self.wither_timer = self.wither_timer.max(duration_secs);
     }
 
     pub fn add_exhaustion(&mut self, amount: f32) {
@@ -1138,7 +1214,22 @@ impl PlayerController {
         let Some(def) = registries.get_node_def(nid) else {
             return false;
         };
-        def.drawtype == DrawType::Normal
+        let lower = def.name.to_ascii_lowercase();
+        let is_non_full_group = def.groups.get("snow_layer").copied().unwrap_or(0) > 0
+            || def.groups.get("slab").copied().unwrap_or(0) > 0
+            || def.groups.get("stair").copied().unwrap_or(0) > 0
+            || def.groups.get("plant").copied().unwrap_or(0) > 0
+            || def.groups.get("flora").copied().unwrap_or(0) > 0
+            || def.groups.get("leaves").copied().unwrap_or(0) > 0
+            || def.groups.get("water").copied().unwrap_or(0) > 0
+            || def.groups.get("liquid").copied().unwrap_or(0) > 0
+            || lower.contains("snow_layer")
+            || lower.contains("tallgrass")
+            || lower.contains("fern")
+            || lower.ends_with(":grass")
+            || lower.contains("grass_");
+        !is_non_full_group
+            && def.drawtype == DrawType::Normal
             && def.walkable
             && def.is_opaque()
             && (def.node_box_type.is_empty() || def.node_box_type == "regular")
@@ -1369,6 +1460,9 @@ impl PlayerController {
             self.vel = Vec3::ZERO;
             self.horizontal_speed = 0.0;
             self.suffocation_timer = 0.0;
+            self.wither_timer = 0.0;
+            self.wither_tick_accum = 0.0;
+            self.reset_fall_state();
             return events;
         }
         self.spawn_invuln_timer = (self.spawn_invuln_timer - dt).max(0.0);
@@ -1581,9 +1675,10 @@ impl PlayerController {
             self.vel.y += (target_vy - self.vel.y) * drag_y;
         } else {
             if input.jump && self.on_ground && !self.disable_jump {
+                self.reset_fall_state();
+                self.peak_air_y = Some(self.pos.y);
                 self.vel.y = Self::JUMP_SPEED;
                 self.on_ground = false;
-                self.max_fall_speed = 0.0;
                 jumped_this_tick = true;
             }
         }
@@ -1700,69 +1795,99 @@ impl PlayerController {
             }
         }
 
-        // 11. Fall Damage on landing transition (`!was_on_ground -> on_ground`)
-        if !was_on_ground && self.on_ground {
-            events.regains_ground = true;
-            let impact_speed = self.max_fall_speed.max(
-                move_res
-                    .collisions
-                    .iter()
-                    .filter(|c| c.axis == CollisionAxis::Y && c.old_speed.y < 0.0)
-                    .map(|c| -c.old_speed.y)
-                    .fold(0.0f32, f32::max),
-            );
-            self.camera_impact = impact_speed;
+        // 11. Fall tracking & landing Fall Damage (`!was_on_ground -> on_ground` after genuine fall > 3.5 blocks)
+        if self.flying || self.in_liquid || self.is_climbing {
+            self.reset_fall_state();
+        } else if !self.on_ground {
+            self.airborne_time += dt;
+            let peak = self
+                .peak_air_y
+                .unwrap_or(pre_step_pos.y)
+                .max(pre_step_pos.y)
+                .max(self.pos.y);
+            self.peak_air_y = Some(peak);
+            if !self.fall_tracking && self.airborne_time > 0.15 && self.vel.y < -4.0 {
+                self.fall_tracking = true;
+                self.fall_start_y = peak;
+            }
+            self.fall_distance = if self.fall_tracking {
+                (self.fall_start_y - self.pos.y).max(0.0)
+            } else {
+                0.0
+            };
+        } else {
+            if !was_on_ground {
+                events.regains_ground = true;
+                let impact_speed = self.max_fall_speed.max(
+                    move_res
+                        .collisions
+                        .iter()
+                        .filter(|c| c.axis == CollisionAxis::Y && c.old_speed.y < 0.0)
+                        .map(|c| -c.old_speed.y)
+                        .fold(0.0f32, f32::max),
+                );
+                self.camera_impact = impact_speed;
 
-            if !self.in_liquid
-                && !self.is_climbing
-                && !self.flying
-                && self.gamemode == GameMode::Survival
-                && self.spawn_invuln_timer <= 0.0
-                && world.gamerules.read().fall_damage
-            {
-                let landing_node_pos = move_res
-                    .collisions
-                    .iter()
-                    .find(|c| c.axis == CollisionAxis::Y && c.old_speed.y < 0.0)
-                    .map(|c| c.node_pos)
-                    .unwrap_or_else(|| {
-                        IVec3::new(
-                            self.pos.x.floor() as i32,
-                            (self.pos.y - 0.05).floor() as i32,
-                            self.pos.z.floor() as i32,
-                        )
-                    });
-                let (landing_id, _, _) = world.get_node(landing_node_pos);
-                let add_percent = registries
-                    .get_node_def(landing_id)
-                    .and_then(|d| d.groups.get("fall_damage_add_percent").copied())
-                    .unwrap_or(0);
-                let factor = (1.0 + add_percent as f32 / 100.0).max(0.0);
-                let effective_speed = impact_speed * factor;
-
-                if effective_speed > Self::SAFE_FALL_SPEED && factor > 0.0 {
-                    let dmg = ((effective_speed - Self::SAFE_FALL_SPEED) + 0.5).floor() as i32;
-                    if dmg > 0 {
-                        self.hp = (self.hp - dmg).max(0);
-                        if self.hp == 0 {
-                            self.death_cause = "Fell from a high place".into();
+                let net_drop = if self.fall_tracking {
+                    (self.fall_start_y - self.pos.y).max(0.0)
+                } else {
+                    0.0
+                };
+                if self.fall_tracking
+                    && net_drop > 3.5
+                    && self.gamemode == GameMode::Survival
+                    && self.spawn_invuln_timer <= 0.0
+                    && world.gamerules.read().fall_damage
+                {
+                    let landing_node_pos = move_res
+                        .collisions
+                        .iter()
+                        .find(|c| c.axis == CollisionAxis::Y && c.old_speed.y < 0.0)
+                        .map(|c| c.node_pos)
+                        .unwrap_or_else(|| {
+                            IVec3::new(
+                                self.pos.x.floor() as i32,
+                                (self.pos.y - 0.05).floor() as i32,
+                                self.pos.z.floor() as i32,
+                            )
+                        });
+                    let (landing_id, _, _) = world.get_node(landing_node_pos);
+                    let add_percent = registries
+                        .get_node_def(landing_id)
+                        .and_then(|d| d.groups.get("fall_damage_add_percent").copied())
+                        .unwrap_or(0);
+                    let factor = (1.0 + add_percent as f32 / 100.0).max(0.0);
+                    if factor > 0.0 {
+                        let dmg = ((net_drop - 3.0) * factor + 0.5).floor() as i32;
+                        if dmg > 0 {
+                            let old_hp = self.hp;
+                            self.hp = (self.hp - dmg).max(0);
+                            log_player_damage(
+                                DamageSource::Fall,
+                                dmg,
+                                old_hp,
+                                self.hp,
+                                self.pos,
+                                &format!("drop={net_drop:.2}m speed={impact_speed:.2}"),
+                            );
+                            if self.hp == 0 {
+                                self.death_cause = "Fell from a high place".into();
+                            }
+                            let fe = FallEvent {
+                                damage: dmg,
+                                node_id: landing_id,
+                            };
+                            self.last_fall_event = Some(fe);
+                            events.fall = Some(fe);
                         }
-                        let fe = FallEvent {
-                            damage: dmg,
-                            node_id: landing_id,
-                        };
-                        self.last_fall_event = Some(fe);
-                        events.fall = Some(fe);
                     }
                 }
+                if let Some(nid) = self.footstep_node_at(world, registries) {
+                    events.footstep_node = Some(nid);
+                    self.footstep_node = Some(nid);
+                }
             }
-            self.max_fall_speed = 0.0;
-            if let Some(nid) = self.footstep_node_at(world, registries) {
-                events.footstep_node = Some(nid);
-                self.footstep_node = Some(nid);
-            }
-        } else if self.on_ground || self.flying || self.in_liquid || self.is_climbing {
-            self.max_fall_speed = 0.0;
+            self.reset_fall_state();
         }
 
         // Exact eye-position suffocation check with 0.5s grace period
@@ -1772,7 +1897,16 @@ impl PlayerController {
                     self.suffocation_timer += dt;
                     if self.suffocation_timer >= Self::SUFFOCATION_GRACE_SEC {
                         self.suffocation_timer -= Self::SUFFOCATION_GRACE_SEC;
+                        let old_hp = self.hp;
                         self.hp = (self.hp - 1).max(0);
+                        log_player_damage(
+                            DamageSource::Suffocation,
+                            1,
+                            old_hp,
+                            self.hp,
+                            self.pos,
+                            "eye_center",
+                        );
                         if self.hp == 0 {
                             self.death_cause = "Suffocated in a wall".into();
                         }
@@ -1791,6 +1925,31 @@ impl PlayerController {
         self.horizontal_speed = horiz_dist / dt;
 
         if self.gamemode == GameMode::Survival && !self.is_dead {
+            if self.wither_timer > 0.0 {
+                self.wither_timer = (self.wither_timer - dt).max(0.0);
+                self.wither_tick_accum += dt;
+                if self.wither_tick_accum >= 1.0 {
+                    self.wither_tick_accum -= 1.0;
+                    if self.spawn_invuln_timer <= 0.0 && self.hp > 0 {
+                        let old_hp = self.hp;
+                        self.hp = (self.hp - 1).max(0);
+                        events.wither_damaged = true;
+                        log_player_damage(
+                            DamageSource::Wither,
+                            1,
+                            old_hp,
+                            self.hp,
+                            self.pos,
+                            "wither_decay",
+                        );
+                        if self.hp == 0 {
+                            self.death_cause = "Withered away".into();
+                        }
+                    }
+                }
+            } else {
+                self.wither_tick_accum = 0.0;
+            }
             if jumped_this_tick {
                 self.add_exhaustion(if self.is_sprinting { 0.20 } else { 0.05 });
             }
@@ -1836,7 +1995,16 @@ impl PlayerController {
                         self.starve_timer += dt;
                         if self.starve_timer >= 4.0 {
                             self.starve_timer -= 4.0;
+                            let old_hp = self.hp;
                             self.hp = (self.hp - 1).max(min_hp);
+                            log_player_damage(
+                                DamageSource::Starvation,
+                                old_hp - self.hp,
+                                old_hp,
+                                self.hp,
+                                self.pos,
+                                "hunger_zero",
+                            );
                             if self.hp == 0 {
                                 self.death_cause = "Starved to death".into();
                             }

@@ -1,4 +1,5 @@
 use egui::{Align2, Color32, Pos2, Rect, Stroke, Vec2};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::config::EngineSettings;
@@ -9,7 +10,7 @@ use crate::network::servers::{
     AsyncServerRefresh, ServerEntry,
 };
 use crate::network::tunnel::PlayitTunnelManager;
-use crate::textures::{ResourcePackInfo, TextureAtlas};
+use crate::textures::{is_carterpcs_skin, ResourcePackInfo, SkinInfo, TextureAtlas};
 use crate::ui::theme::{
     mc_button, mc_button_green, mc_button_styled, mc_button_with_sound, mc_shadow_text,
     mc_slider_f32, paint_dirt_screen_bg, paint_player_skin_card, ItemIconCache, McTheme,
@@ -27,6 +28,7 @@ pub enum TitlePage {
     Multiplayer,
     HostWan,
     Options,
+    Skins,
     ResourcePacks,
 }
 
@@ -77,6 +79,9 @@ pub struct TitleScreenState {
     pub icons: ItemIconCache,
     pub server_refresher: AsyncServerRefresh,
     pub connected_controllers: Vec<String>,
+    pub available_skins: Vec<SkinInfo>,
+    pub skin_edit_slot: usize,
+    pub skin_preview_handles: HashMap<String, egui::TextureHandle>,
 }
 
 impl TitleScreenState {
@@ -108,6 +113,9 @@ impl TitleScreenState {
             icons: ItemIconCache::new(),
             server_refresher: AsyncServerRefresh::default(),
             connected_controllers: Vec::new(),
+            available_skins: Vec::new(),
+            skin_edit_slot: 0,
+            skin_preview_handles: HashMap::new(),
         }
     }
 
@@ -298,13 +306,35 @@ pub fn render_title_screen_with_atlas(
                     let card_w = 180.0;
                     let card_h = 224.0;
                     let card_x = (cx + bw * 0.5 + 36.0).min(screen.right() - card_w - 20.0);
+                    let active_p1_tex = state
+                        .available_skins
+                        .iter()
+                        .find(|s| s.id.eq_ignore_ascii_case(&settings.player_skin))
+                        .map(|sk| {
+                            state
+                                .skin_preview_handles
+                                .entry(sk.id.clone())
+                                .or_insert_with(|| {
+                                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                        [sk.image.width() as usize, sk.image.height() as usize],
+                                        sk.image.as_raw(),
+                                    );
+                                    ctx.load_texture(
+                                        format!("skin_preview_{}", sk.id),
+                                        ci,
+                                        egui::TextureOptions::NEAREST,
+                                    )
+                                })
+                                .clone()
+                        })
+                        .or_else(|| state.icons.skin_tex.clone());
                     if card_x > cx + bw * 0.5 + 8.0 {
-                        let card_y = (screen.height() * 0.44).min(screen.bottom() - card_h - 46.0);
+                        let card_y = (screen.height() * 0.40).min(screen.bottom() - card_h - 84.0);
                         let card_r = Rect::from_min_size(Pos2::new(card_x, card_y), Vec2::new(card_w, card_h));
                         paint_player_skin_card(
                             p,
                             card_r,
-                            state.icons.skin_tex.as_ref(),
+                            active_p1_tex.as_ref(),
                             &settings.player_name,
                             time_sec,
                         );
@@ -315,6 +345,29 @@ pub fn render_title_screen_with_atlas(
                                 action = TitleAction::ApplySettings;
                             }
                         });
+                        if btn(
+                            ui,
+                            theme,
+                            card_x + 10.0,
+                            card_r.bottom() + 38.0,
+                            card_w - 20.0,
+                            34.0,
+                            "Skins...",
+                            is_carterpcs_skin(&settings.player_skin),
+                        ) {
+                            state.page = TitlePage::Skins;
+                        }
+                    } else if btn(
+                        ui,
+                        theme,
+                        cx - bw * 0.5,
+                        y + 52.0,
+                        bw,
+                        40.0,
+                        "Skins...",
+                        is_carterpcs_skin(&settings.player_skin),
+                    ) {
+                        state.page = TitlePage::Skins;
                     }
 
                     // Bottom corner version & profile footer
@@ -848,8 +901,23 @@ pub fn render_title_screen_with_atlas(
                                         settings.vsync = !settings.vsync;
                                         action = TitleAction::ApplySettings;
                                     }
-                                    if mc_button_styled(ui, theme, &format!("Mipmapping: {}", on_off(settings.mipmapping)), col_w, 40.0, settings.mipmapping).clicked() {
-                                        settings.mipmapping = !settings.mipmapping;
+                                    if mc_button_styled(
+                                        ui,
+                                        theme,
+                                        &format!(
+                                            "Anisotropic & Mipmap: {}",
+                                            settings.anisotropy_quality.label()
+                                        ),
+                                        col_w,
+                                        40.0,
+                                        settings.anisotropy_quality.is_enabled(),
+                                    )
+                                    .clicked()
+                                    {
+                                        settings.anisotropy_quality =
+                                            settings.anisotropy_quality.cycle();
+                                        settings.mipmapping =
+                                            settings.anisotropy_quality.is_enabled();
                                         action = TitleAction::ApplySettings;
                                     }
                                     ui.end_row();
@@ -944,6 +1012,37 @@ pub fn render_title_screen_with_atlas(
 
                     if btn(ui, theme, cx - 120.0, screen.bottom() - 68.0, 240.0, 42.0, "Done", true) {
                         state.listening_keybind = None;
+                        state.page = TitlePage::Home;
+                    }
+                }
+
+                TitlePage::Skins => {
+                    mc_shadow_text(p, Pos2::new(cx, 34.0), Align2::CENTER_CENTER, "Player Skins", 22.0, Color32::WHITE);
+                    let w = (screen.width() * 0.68).clamp(520.0, 740.0);
+                    let panel_r = Rect::from_min_max(
+                        Pos2::new(cx - w * 0.5, 72.0),
+                        Pos2::new(cx + w * 0.5, screen.bottom() - 88.0),
+                    );
+                    let skins = state.available_skins.clone();
+                    let changed = ui
+                        .allocate_new_ui(egui::UiBuilder::new().max_rect(panel_r), |ui| {
+                            crate::ui::pause_menu::paint_skin_selector_panel(
+                                ctx,
+                                ui,
+                                theme,
+                                settings,
+                                &skins,
+                                &mut state.skin_edit_slot,
+                                &mut state.skin_preview_handles,
+                                panel_r,
+                                time_sec,
+                            )
+                        })
+                        .inner;
+                    if changed {
+                        action = TitleAction::ApplySettings;
+                    }
+                    if btn(ui, theme, cx - 120.0, screen.bottom() - 68.0, 240.0, 42.0, "Done", true) {
                         state.page = TitlePage::Home;
                     }
                 }

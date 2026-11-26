@@ -13,20 +13,26 @@ pub use self::bloom::{BloomPostProcess, BloomTargets};
 
 pub use self::camera::{compute_camera_rig, CameraMode, CameraRig};
 pub use self::entity_model::{
-    build_entity_rig_mesh, build_falling_node_mesh, canonical_mob_texture_for_entity,
-    classify_entity_rig, fill_transparent_mob_pixels, hurt_tint_for_flash,
-    make_fallback_mob_texture, resolve_entity_block_layers, EntityRenderSnapshot, EntityRigKind,
+    build_dropped_ram_mic_mesh, build_entity_rig_mesh, build_falling_node_mesh,
+    canonical_mob_texture_for_entity, classify_entity_rig, fill_transparent_mob_pixels,
+    hurt_tint_for_flash, make_fallback_mob_texture, resolve_entity_block_layers,
+    EntityRenderSnapshot, EntityRigKind,
 };
 pub use self::pipeline::{
     build_crack_overlay, build_selection_wireframe, IndexedMeshBuffers, LineVertex, ParticleSystem,
 };
 pub use self::player_model::{
-    build_player_model_vertices, build_player_model_vertices_lit, PlayerModelMesh,
-    PlayerModelState, PlayerPartCounts,
+    build_player_model_vertices, build_player_model_vertices_lit, carter_hair_palette_image,
+    PlayerModelMesh, PlayerModelState, PlayerPartCounts,
 };
 pub use self::shadow::ShadowMapRenderer;
-pub use self::sky::{compute_sky_palette, SkyPalette, SkyRenderer, SkyUniform};
-pub use self::viewmodel::{build_viewmodel_mesh, build_viewmodel_mesh_ex, ViewmodelMesh, ViewmodelState};
+pub use self::sky::{
+    compute_nether_sky_palette, compute_sky_palette, SkyPalette, SkyRenderer, SkyUniform,
+};
+pub use self::viewmodel::{
+    build_viewmodel_mesh, build_viewmodel_mesh_ex, build_viewmodel_mesh_with_skin,
+    create_ram_mic_mesh, ram_mic_palette_image, ViewmodelMesh, ViewmodelState,
+};
 
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3};
@@ -37,11 +43,11 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::config::EngineSettings;
+use crate::config::{AnisotropyQuality, EngineSettings};
 use crate::registry::EngineRegistries;
 use crate::textures::TextureAtlas;
 use crate::world::light::relight_around_pos;
-use crate::world::WorldStore;
+use crate::world::{DimensionId, WorldStore};
 
 use self::frustum::Frustum;
 use self::mesher::{mesh_chunks_parallel_with_atlas, ChunkMeshData, VoxelVertex};
@@ -113,6 +119,7 @@ pub struct ViewportCamera {
     /// Bitmask of local player character bodies (`1 << slot`, bits `0..=3`) to draw in this viewport.
     pub draw_local_player_mask: u8,
     pub draw_viewmodel: bool,
+    pub dimension: DimensionId,
 }
 
 /// Snapshot for updating an animated 3D remote LAN player mesh.
@@ -135,6 +142,8 @@ pub struct RemotePlayerRenderSlot {
     pub world_pos: Vec3,
     pub model: PlayerModelState,
     body_buffers: IndexedMeshBuffers,
+    overlay_buffers: IndexedMeshBuffers,
+    crown_buffers: IndexedMeshBuffers,
     held_buffers: IndexedMeshBuffers,
     held_tex_bg: Option<wgpu::BindGroup>,
     held_uses_atlas: bool,
@@ -147,6 +156,8 @@ impl RemotePlayerRenderSlot {
             world_pos: Vec3::ZERO,
             model: PlayerModelState::new(),
             body_buffers: IndexedMeshBuffers::empty(),
+            overlay_buffers: IndexedMeshBuffers::empty(),
+            crown_buffers: IndexedMeshBuffers::empty(),
             held_buffers: IndexedMeshBuffers::empty(),
             held_tex_bg: None,
             held_uses_atlas: true,
@@ -189,6 +200,8 @@ pub struct PlayerRenderSlot {
     pub show_player_model: bool,
     pub player_world_pos: Vec3,
     player_body_buffers: IndexedMeshBuffers,
+    player_overlay_buffers: IndexedMeshBuffers,
+    player_crown_buffers: IndexedMeshBuffers,
     player_held_buffers: IndexedMeshBuffers,
     player_held_tex_bg: Option<wgpu::BindGroup>,
     player_held_uses_atlas: bool,
@@ -222,6 +235,8 @@ impl Default for PlayerRenderSlot {
             show_player_model: false,
             player_world_pos: Vec3::ZERO,
             player_body_buffers: IndexedMeshBuffers::empty(),
+            player_overlay_buffers: IndexedMeshBuffers::empty(),
+            player_crown_buffers: IndexedMeshBuffers::empty(),
             player_held_buffers: IndexedMeshBuffers::empty(),
             player_held_tex_bg: None,
             player_held_uses_atlas: true,
@@ -257,6 +272,8 @@ pub struct WgpuRenderer {
 
     viewport_cams: [ViewportCamBuffers; 4],
     pub tex_bind_group_layout: wgpu::BindGroupLayout,
+    atlas_tex_view: wgpu::TextureView,
+    anisotropy_quality: AnisotropyQuality,
     pub tex_bind_group: wgpu::BindGroup,
 
     pub opaque_pipeline: wgpu::RenderPipeline,
@@ -274,6 +291,7 @@ pub struct WgpuRenderer {
 
     pub egui_renderer: egui_wgpu::Renderer,
     pub chunk_meshes: HashMap<IVec3, GpuChunkMesh>,
+    pub nether_chunk_meshes: HashMap<IVec3, GpuChunkMesh>,
 
     // Selection wireframe & progressive break crack overlay
     selection_vb: Option<wgpu::Buffer>,
@@ -285,8 +303,9 @@ pub struct WgpuRenderer {
     last_crack_stage: Option<u8>,
     last_crack_boxes: Vec<([f32; 3], [f32; 3])>,
 
-    // 3D block-break particle burst system
+    // 3D block-break & atmospheric particle systems per dimension
     pub particles: ParticleSystem,
+    pub nether_particles: ParticleSystem,
 
     // First-person viewmodel state & GPU buffers
     pub viewmodel: ViewmodelState,
@@ -305,8 +324,13 @@ pub struct WgpuRenderer {
     pub show_player_model: bool,
     player_world_pos: Vec3,
     player_body_buffers: IndexedMeshBuffers,
+    player_overlay_buffers: IndexedMeshBuffers,
+    player_crown_buffers: IndexedMeshBuffers,
     player_skin_tex_bg: Option<wgpu::BindGroup>,
     player_skin_dims: Option<(u32, u32)>,
+    crown_palette_tex_bg: wgpu::BindGroup,
+    skin_tex_cache: HashMap<String, (wgpu::BindGroup, (u32, u32))>,
+    skin_rgba_cache: HashMap<String, RgbaImage>,
     player_held_buffers: IndexedMeshBuffers,
     player_held_tex_bg: Option<wgpu::BindGroup>,
     player_held_uses_atlas: bool,
@@ -327,6 +351,9 @@ pub struct WgpuRenderer {
     // Active 3D LuaEntity/mob GPU batches & cached texture bind groups
     entity_tex_cache: HashMap<String, (wgpu::BindGroup, u32, u32)>,
     entity_draw_batches: Vec<(String, IndexedMeshBuffers)>,
+    nether_entity_draw_batches: Vec<(String, IndexedMeshBuffers)>,
+    laser_vb: Option<wgpu::Buffer>,
+    laser_vert_count: u32,
 
     // Offscreen cloud-streaming render target & readback buffer (for mobile LAN streaming)
     stream_target: Option<(wgpu::Texture, wgpu::TextureView, wgpu::TextureView, u32, u32)>,
@@ -465,7 +492,7 @@ impl WgpuRenderer {
 
         let cam_init = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
-            camera_pos: [0.0, 24.0, 0.0, 1.0],
+            camera_pos: [0.0, 24.0, 0.0, 0.0],
             sun_dir_time: [0.4, 0.85, 0.3, 0.0],
             fog_color_dist: [0.46, 0.72, 0.96, 160.0],
             flags: [1.0, 0.0, 1.0, 1.0],
@@ -575,7 +602,14 @@ impl WgpuRenderer {
             ],
         });
 
-        let tex_bind_group = Self::upload_atlas_internal(&device, &queue, &tex_bind_group_layout, atlas);
+        let anisotropy_quality = AnisotropyQuality::Off;
+        let (atlas_tex_view, tex_bind_group) = Self::upload_atlas_internal(
+            &device,
+            &queue,
+            &tex_bind_group_layout,
+            atlas,
+            anisotropy_quality,
+        );
 
         let shadow = ShadowMapRenderer::new(&device);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -755,6 +789,13 @@ impl WgpuRenderer {
             build_voxel_pipelines(hdr_format, "Hdr");
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let crown_palette_img = carter_hair_palette_image();
+        let crown_palette_tex_bg = Self::upload_single_layer_bind_group(
+            &device,
+            &queue,
+            &tex_bind_group_layout,
+            &crown_palette_img,
+        );
 
         Ok(Self {
             instance,
@@ -770,6 +811,8 @@ impl WgpuRenderer {
             offscreen_color: None,
             viewport_cams,
             tex_bind_group_layout,
+            atlas_tex_view,
+            anisotropy_quality,
             tex_bind_group,
             opaque_pipeline,
             trans_pipeline,
@@ -785,6 +828,7 @@ impl WgpuRenderer {
             bloom_targets: None,
             egui_renderer,
             chunk_meshes: HashMap::new(),
+            nether_chunk_meshes: HashMap::new(),
             selection_vb: None,
             selection_vert_count: 0,
             last_selection_boxes: Vec::new(),
@@ -794,6 +838,7 @@ impl WgpuRenderer {
             last_crack_stage: None,
             last_crack_boxes: Vec::new(),
             particles: ParticleSystem::new(),
+            nether_particles: ParticleSystem::new(),
             viewmodel: ViewmodelState::new(),
             show_viewmodel: false,
             viewmodel_mesh: None,
@@ -808,8 +853,13 @@ impl WgpuRenderer {
             show_player_model: false,
             player_world_pos: Vec3::ZERO,
             player_body_buffers: IndexedMeshBuffers::empty(),
+            player_overlay_buffers: IndexedMeshBuffers::empty(),
+            player_crown_buffers: IndexedMeshBuffers::empty(),
             player_skin_tex_bg: None,
             player_skin_dims: None,
+            crown_palette_tex_bg,
+            skin_tex_cache: HashMap::new(),
+            skin_rgba_cache: HashMap::new(),
             player_held_buffers: IndexedMeshBuffers::empty(),
             player_held_tex_bg: None,
             player_held_uses_atlas: true,
@@ -822,6 +872,9 @@ impl WgpuRenderer {
             fog_dist_override: None,
             entity_tex_cache: HashMap::new(),
             entity_draw_batches: Vec::new(),
+            nether_entity_draw_batches: Vec::new(),
+            laser_vb: None,
+            laser_vert_count: 0,
             stream_target: None,
             stream_readback_buf: None,
             last_draw_calls: 0,
@@ -943,14 +996,49 @@ impl WgpuRenderer {
         })
     }
 
+    fn create_atlas_sampler(device: &wgpu::Device, quality: AnisotropyQuality) -> wgpu::Sampler {
+        let aniso = quality.clamp_u16();
+        if aniso > 1 {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("HybridAnisoAtlasSampler"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Linear,
+                lod_min_clamp: 0.0,
+                lod_max_clamp: 4.0,
+                anisotropy_clamp: aniso,
+                ..Default::default()
+            })
+        } else {
+            device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("NearestRepeatSampler"),
+                address_mode_u: wgpu::AddressMode::Repeat,
+                address_mode_v: wgpu::AddressMode::Repeat,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                lod_min_clamp: 0.0,
+                lod_max_clamp: 0.0,
+                anisotropy_clamp: 1,
+                ..Default::default()
+            })
+        }
+    }
+
     fn upload_atlas_internal(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
         atlas: &TextureAtlas,
-    ) -> wgpu::BindGroup {
-        let (w, h, layers, bytes) = atlas.pack_rgba_bytes();
+        quality: AnisotropyQuality,
+    ) -> (wgpu::TextureView, wgpu::BindGroup) {
+        let (w, h, layers, mips, per_mip_bytes) = atlas.pack_mipmapped_rgba_bytes();
         let layers = layers.max(1);
+        let mips = mips.max(1);
 
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("VoxelTextureArray"),
@@ -959,7 +1047,7 @@ impl WgpuRenderer {
                 height: h,
                 depth_or_array_layers: layers,
             },
-            mip_level_count: 1,
+            mip_level_count: mips,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -967,43 +1055,37 @@ impl WgpuRenderer {
             view_formats: &[],
         });
 
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * w),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: layers,
-            },
-        );
+        for (m_idx, mip_bytes) in per_mip_bytes.iter().enumerate() {
+            let mw = (w >> m_idx).max(1);
+            let mh = (h >> m_idx).max(1);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: m_idx as u32,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                mip_bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * mw),
+                    rows_per_image: Some(mh),
+                },
+                wgpu::Extent3d {
+                    width: mw,
+                    height: mh,
+                    depth_or_array_layers: layers,
+                },
+            );
+        }
 
         let view = tex.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("NearestRepeatSampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let sampler = Self::create_atlas_sampler(device, quality);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("TexArrayBG"),
             layout,
             entries: &[
@@ -1016,7 +1098,34 @@ impl WgpuRenderer {
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
-        })
+        });
+        (view, bg)
+    }
+
+    pub fn set_anisotropy_quality(&mut self, quality: AnisotropyQuality) {
+        if self.anisotropy_quality == quality {
+            return;
+        }
+        self.anisotropy_quality = quality;
+        let sampler = Self::create_atlas_sampler(&self.device, quality);
+        self.tex_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("TexArrayBG"),
+            layout: &self.tex_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.atlas_tex_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+    }
+
+    pub fn anisotropy_quality(&self) -> AnisotropyQuality {
+        self.anisotropy_quality
     }
 
     pub fn wait_idle(&self) {
@@ -1024,15 +1133,20 @@ impl WgpuRenderer {
     }
 
     pub fn reload_atlas(&mut self, atlas: &TextureAtlas) {
-        self.tex_bind_group = Self::upload_atlas_internal(
+        let (view, bg) = Self::upload_atlas_internal(
             &self.device,
             &self.queue,
             &self.tex_bind_group_layout,
             atlas,
+            self.anisotropy_quality,
         );
+        self.atlas_tex_view = view;
+        self.tex_bind_group = bg;
         self.viewmodel_cached_key.clear();
         self.player_skin_tex_bg = None;
         self.player_skin_dims = None;
+        self.skin_tex_cache.remove("default");
+        self.skin_rgba_cache.remove("default");
         self.player_held_cached_key.clear();
         for peer in &mut self.peers {
             peer.viewmodel_cached_key.clear();
@@ -1170,8 +1284,7 @@ impl WgpuRenderer {
         }
     }
 
-    /// Upload a single `ChunkMeshData` directly to GPU buffers.
-    pub fn upload_chunk_mesh_now(&mut self, mesh: ChunkMeshData) {
+    fn build_gpu_chunk_mesh(&self, mesh: ChunkMeshData) -> GpuChunkMesh {
         let opaque_vb = if !mesh.opaque_verts.is_empty() {
             Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("ChunkOpaqueVB"),
@@ -1209,18 +1322,30 @@ impl WgpuRenderer {
             None
         };
 
-        self.chunk_meshes.insert(
-            mesh.chunk_pos,
-            GpuChunkMesh {
-                chunk_pos: mesh.chunk_pos,
-                opaque_vb,
-                opaque_ib,
-                opaque_index_count: mesh.opaque_indices.len() as u32,
-                trans_vb,
-                trans_ib,
-                trans_index_count: mesh.trans_indices.len() as u32,
-            },
-        );
+        GpuChunkMesh {
+            chunk_pos: mesh.chunk_pos,
+            opaque_vb,
+            opaque_ib,
+            opaque_index_count: mesh.opaque_indices.len() as u32,
+            trans_vb,
+            trans_ib,
+            trans_index_count: mesh.trans_indices.len() as u32,
+        }
+    }
+
+    /// Upload a single `ChunkMeshData` directly to Overworld GPU buffers.
+    pub fn upload_chunk_mesh_now(&mut self, mesh: ChunkMeshData) {
+        self.upload_chunk_mesh_for_dimension(mesh, DimensionId::Overworld);
+    }
+
+    pub fn upload_chunk_mesh_for_dimension(&mut self, mesh: ChunkMeshData, dim: DimensionId) {
+        let cpos = mesh.chunk_pos;
+        let gpu_mesh = self.build_gpu_chunk_mesh(mesh);
+        if dim.is_nether() {
+            self.nether_chunk_meshes.insert(cpos, gpu_mesh);
+        } else {
+            self.chunk_meshes.insert(cpos, gpu_mesh);
+        }
     }
 
     /// Upload pending background `ChunkMeshData` buffers within a strict `budget_ms` GPU budget.
@@ -1229,6 +1354,21 @@ impl WgpuRenderer {
         pending: &mut VecDeque<ChunkMeshData>,
         max_chunks: usize,
         budget_ms: f32,
+    ) -> usize {
+        self.upload_meshes_budgeted_for_dimension(
+            pending,
+            max_chunks,
+            budget_ms,
+            DimensionId::Overworld,
+        )
+    }
+
+    pub fn upload_meshes_budgeted_for_dimension(
+        &mut self,
+        pending: &mut VecDeque<ChunkMeshData>,
+        max_chunks: usize,
+        budget_ms: f32,
+        dim: DimensionId,
     ) -> usize {
         let start = Instant::now();
         let budget_secs = (budget_ms * 0.001).max(0.0);
@@ -1240,7 +1380,7 @@ impl WgpuRenderer {
             let Some(mesh) = pending.pop_front() else {
                 break;
             };
-            self.upload_chunk_mesh_now(mesh);
+            self.upload_chunk_mesh_for_dimension(mesh, dim);
             uploaded += 1;
         }
         uploaded
@@ -1257,16 +1397,40 @@ impl WgpuRenderer {
         centers: &[(i32, i32)],
         keep_radius: i32,
     ) -> usize {
+        self.prune_distant_chunks_for_dimension(DimensionId::Overworld, centers, keep_radius)
+    }
+
+    pub fn prune_distant_chunks_for_dimension(
+        &mut self,
+        dim: DimensionId,
+        centers: &[(i32, i32)],
+        keep_radius: i32,
+    ) -> usize {
+        let map = if dim.is_nether() {
+            &mut self.nether_chunk_meshes
+        } else {
+            &mut self.chunk_meshes
+        };
         if centers.is_empty() {
-            return 0;
+            let cleared = map.len();
+            map.clear();
+            return cleared;
         }
-        let before = self.chunk_meshes.len();
-        self.chunk_meshes.retain(|cpos, _| {
+        let before = map.len();
+        map.retain(|cpos, _| {
             centers.iter().any(|&(cx, cz)| {
                 (cpos.x - cx).abs() <= keep_radius && (cpos.z - cz).abs() <= keep_radius
             })
         });
-        before - self.chunk_meshes.len()
+        before - map.len()
+    }
+
+    pub fn particles_for_mut(&mut self, dim: DimensionId) -> &mut ParticleSystem {
+        if dim.is_nether() {
+            &mut self.nether_particles
+        } else {
+            &mut self.particles
+        }
     }
 
     /// Priority same-frame synchronous remeshing for player block break/place edits (`<= 0ms` queue delay).
@@ -1288,10 +1452,11 @@ impl WgpuRenderer {
         if snaps.is_empty() {
             return 0;
         }
+        let dim = world.dimension;
         let meshes = mesh_chunks_parallel_with_atlas(snaps, registries, atlas, smooth_lighting);
         let count = meshes.len();
         for mesh in meshes {
-            self.upload_chunk_mesh_now(mesh);
+            self.upload_chunk_mesh_for_dimension(mesh, dim);
         }
         count
     }
@@ -1542,7 +1707,14 @@ impl WgpuRenderer {
             self.viewmodel.last_item_name = item_key.to_string();
             self.viewmodel_cached_key = item_key.to_string();
 
-            let mesh = build_viewmodel_mesh_ex(Some(item_key), self.viewmodel_extruded, registries, atlas);
+            let skin_opt = self.skin_rgba_cache.get(&self.player_model.skin_id);
+            let mesh = build_viewmodel_mesh_with_skin(
+                Some(item_key),
+                self.viewmodel_extruded,
+                skin_opt,
+                registries,
+                atlas,
+            );
             self.viewmodel_uses_atlas = mesh.texture.is_none();
             if let Some(ref img) = mesh.texture {
                 self.viewmodel_tex_bg = Some(Self::upload_single_layer_bind_group(
@@ -1611,6 +1783,12 @@ impl WgpuRenderer {
             return;
         }
         let extruded = self.viewmodel_extruded;
+        let slot_skin_id = self
+            .peers
+            .get(slot - 1)
+            .map(|p| p.player_model.skin_id.clone())
+            .unwrap_or_else(|| "default".into());
+        let slot_skin_img = self.skin_rgba_cache.get(&slot_skin_id).cloned();
         let Some(peer) = self.peers.get_mut(slot - 1) else {
             return;
         };
@@ -1629,7 +1807,13 @@ impl WgpuRenderer {
             peer.viewmodel.last_item_name = item_key.to_string();
             peer.viewmodel_cached_key = item_key.to_string();
 
-            let mesh = build_viewmodel_mesh_ex(Some(item_key), extruded, registries, atlas);
+            let mesh = build_viewmodel_mesh_with_skin(
+                Some(item_key),
+                extruded,
+                slot_skin_img.as_ref(),
+                registries,
+                atlas,
+            );
             peer.viewmodel_uses_atlas = mesh.texture.is_none();
             if let Some(ref img) = mesh.texture {
                 peer.viewmodel_tex_bg = Some(Self::upload_single_layer_bind_group(
@@ -1697,6 +1881,67 @@ impl WgpuRenderer {
 
     /// Update 3D articulated character geometry for local player `slot` (`1..=3` for P2..P4, `0` = P1).
     #[allow(clippy::too_many_arguments)]
+    pub fn set_player_skin(&mut self, slot: usize, skin_id: &str, skin_rgba: &RgbaImage) {
+        let key = if skin_id.trim().is_empty() {
+            "default".to_string()
+        } else {
+            skin_id.trim().to_string()
+        };
+        let dims = (skin_rgba.width().max(1), skin_rgba.height().max(1));
+        let bg = Self::upload_single_layer_bind_group(
+            &self.device,
+            &self.queue,
+            &self.tex_bind_group_layout,
+            skin_rgba,
+        );
+        self.skin_tex_cache.insert(key.clone(), (bg, dims));
+        self.skin_rgba_cache.insert(key.clone(), skin_rgba.clone());
+        if key == "default" {
+            self.player_skin_tex_bg = Some(Self::upload_single_layer_bind_group(
+                &self.device,
+                &self.queue,
+                &self.tex_bind_group_layout,
+                skin_rgba,
+            ));
+            self.player_skin_dims = Some(dims);
+        }
+        if slot == 0 {
+            self.player_model.skin_id = key;
+            self.viewmodel_cached_key.clear();
+            self.viewmodel_mesh = None;
+        } else if let Some(peer) = self.peers.get_mut(slot - 1) {
+            peer.player_model.skin_id = key;
+            peer.viewmodel_cached_key.clear();
+            peer.viewmodel_mesh = None;
+        }
+    }
+
+    fn skin_bind_group_for(&self, skin_id: &str) -> Option<&wgpu::BindGroup> {
+        let key = if skin_id.trim().is_empty() {
+            "default"
+        } else {
+            skin_id.trim()
+        };
+        self.skin_tex_cache
+            .get(key)
+            .map(|(bg, _)| bg)
+            .or(self.player_skin_tex_bg.as_ref())
+    }
+
+    fn skin_dims_for(&mut self, skin_id: &str, atlas: &TextureAtlas) -> (u32, u32) {
+        let key = if skin_id.trim().is_empty() {
+            "default"
+        } else {
+            skin_id.trim()
+        };
+        if let Some((_, dims)) = self.skin_tex_cache.get(key) {
+            return *dims;
+        }
+        self.ensure_player_skin_uploaded(atlas)
+    }
+
+    /// Update 3rd-person articulated character geometry & GPU buffers for any local player slot (`0..=3`).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_peer_player_model(
         &mut self,
         slot: usize,
@@ -1727,7 +1972,8 @@ impl WgpuRenderer {
         if slot > 3 {
             return;
         }
-        let (skin_w, skin_h) = self.ensure_player_skin_uploaded(atlas);
+        let skin_id = self.peers[slot - 1].player_model.skin_id.clone();
+        let (skin_w, skin_h) = self.skin_dims_for(&skin_id, atlas);
         let peer = &mut self.peers[slot - 1];
         peer.player_world_pos = player_pos;
         let held_key = held_item_name
@@ -1766,11 +2012,25 @@ impl WgpuRenderer {
             atlas,
         );
         apply_player_hurt_flash(&mut mesh.body_verts, peer.hurt_flash);
+        apply_player_hurt_flash(&mut mesh.overlay_verts, peer.hurt_flash);
+        apply_player_hurt_flash(&mut mesh.crown_verts, peer.hurt_flash);
         peer.player_body_buffers = IndexedMeshBuffers::from_mesh(
             &self.device,
             &format!("Peer{slot}ModelBody"),
             &mesh.body_verts,
             &mesh.body_indices,
+        );
+        peer.player_overlay_buffers = IndexedMeshBuffers::from_mesh(
+            &self.device,
+            &format!("Peer{slot}ModelOverlay"),
+            &mesh.overlay_verts,
+            &mesh.overlay_indices,
+        );
+        peer.player_crown_buffers = IndexedMeshBuffers::from_mesh(
+            &self.device,
+            &format!("Peer{slot}ModelCrown"),
+            &mesh.crown_verts,
+            &mesh.crown_indices,
         );
         peer.player_held_buffers = IndexedMeshBuffers::from_mesh(
             &self.device,
@@ -1894,11 +2154,25 @@ impl WgpuRenderer {
                 atlas,
             );
             apply_player_hurt_flash(&mut mesh.body_verts, snap.hurt_flash);
+            apply_player_hurt_flash(&mut mesh.overlay_verts, snap.hurt_flash);
+            apply_player_hurt_flash(&mut mesh.crown_verts, snap.hurt_flash);
             entry.body_buffers = IndexedMeshBuffers::from_mesh(
                 &self.device,
                 "RemotePlayerBody",
                 &mesh.body_verts,
                 &mesh.body_indices,
+            );
+            entry.overlay_buffers = IndexedMeshBuffers::from_mesh(
+                &self.device,
+                "RemotePlayerOverlay",
+                &mesh.overlay_verts,
+                &mesh.overlay_indices,
+            );
+            entry.crown_buffers = IndexedMeshBuffers::from_mesh(
+                &self.device,
+                "RemotePlayerCrown",
+                &mesh.crown_verts,
+                &mesh.crown_indices,
             );
             entry.held_buffers = IndexedMeshBuffers::from_mesh(
                 &self.device,
@@ -1999,22 +2273,8 @@ impl WgpuRenderer {
             held_opt,
         );
 
-        let (skin_w, skin_h) = if let (Some(_), Some(dims)) =
-            (&self.player_skin_tex_bg, self.player_skin_dims)
-        {
-            dims
-        } else {
-            let skin_img = atlas.get_player_skin_rgba();
-            let dims = (skin_img.width(), skin_img.height());
-            self.player_skin_tex_bg = Some(Self::upload_single_layer_bind_group(
-                &self.device,
-                &self.queue,
-                &self.tex_bind_group_layout,
-                &skin_img,
-            ));
-            self.player_skin_dims = Some(dims);
-            dims
-        };
+        let skin_id = self.player_model.skin_id.clone();
+        let (skin_w, skin_h) = self.skin_dims_for(&skin_id, atlas);
 
         let mut mesh = build_player_model_vertices_lit(
             &self.player_model,
@@ -2027,11 +2287,25 @@ impl WgpuRenderer {
             atlas,
         );
         apply_player_hurt_flash(&mut mesh.body_verts, self.player_hurt_flash);
+        apply_player_hurt_flash(&mut mesh.overlay_verts, self.player_hurt_flash);
+        apply_player_hurt_flash(&mut mesh.crown_verts, self.player_hurt_flash);
         self.player_body_buffers = IndexedMeshBuffers::from_mesh(
             &self.device,
             "PlayerModelBody",
             &mesh.body_verts,
             &mesh.body_indices,
+        );
+        self.player_overlay_buffers = IndexedMeshBuffers::from_mesh(
+            &self.device,
+            "PlayerModelOverlay",
+            &mesh.overlay_verts,
+            &mesh.overlay_indices,
+        );
+        self.player_crown_buffers = IndexedMeshBuffers::from_mesh(
+            &self.device,
+            "PlayerModelCrown",
+            &mesh.crown_verts,
+            &mesh.crown_indices,
         );
         self.player_held_buffers = IndexedMeshBuffers::from_mesh(
             &self.device,
@@ -2056,16 +2330,89 @@ impl WgpuRenderer {
         }
     }
 
-    /// Build batched articulated 3D voxel meshes and cache textures for all active world entities.
+    /// Build batched articulated 3D voxel meshes and cache textures for Overworld world entities.
     pub fn update_entities(
         &mut self,
         entities: &[EntityRenderSnapshot],
         registries: &EngineRegistries,
         atlas: &TextureAtlas,
     ) {
-        self.entity_draw_batches.clear();
-        if entities.is_empty() {
+        self.entity_draw_batches = self.build_entity_batches(entities, registries, atlas);
+    }
+
+    /// Build batched articulated 3D voxel meshes and cache textures for Nether world entities.
+    pub fn update_nether_entities(
+        &mut self,
+        entities: &[EntityRenderSnapshot],
+        registries: &EngineRegistries,
+        atlas: &TextureAtlas,
+    ) {
+        self.nether_entity_draw_batches = self.build_entity_batches(entities, registries, atlas);
+    }
+
+    /// Upload world-space charging laser beams for Overworld Ocean Monument Guardians.
+    pub fn update_guardian_lasers(&mut self, beams: &[crate::world::GuardianLaserBeam]) {
+        if beams.is_empty() {
+            self.laser_vert_count = 0;
             return;
+        }
+        let mut verts: Vec<LineVertex> = Vec::with_capacity(beams.len() * 10);
+        for b in beams {
+            let p = b.progress.clamp(0.0, 1.0);
+            let col = if p < 0.5 {
+                let t = p * 2.0;
+                [
+                    0.25 + (1.0 - 0.25) * t,
+                    0.95 + (0.92 - 0.95) * t,
+                    1.0 + (0.25 - 1.0) * t,
+                    0.95,
+                ]
+            } else {
+                let t = (p - 0.5) * 2.0;
+                [
+                    1.0,
+                    0.92 + (0.22 - 0.92) * t,
+                    0.25 + (0.88 - 0.25) * t,
+                    1.0,
+                ]
+            };
+            let offsets = [
+                Vec3::ZERO,
+                Vec3::new(0.035, 0.0, 0.0),
+                Vec3::new(-0.035, 0.0, 0.0),
+                Vec3::new(0.0, 0.035, 0.0),
+                Vec3::new(0.0, -0.035, 0.0),
+            ];
+            for off in offsets {
+                verts.push(LineVertex {
+                    pos: (b.start + off).to_array(),
+                    color: col,
+                });
+                verts.push(LineVertex {
+                    pos: (b.end + off).to_array(),
+                    color: col,
+                });
+            }
+        }
+        self.laser_vert_count = verts.len() as u32;
+        self.laser_vb = Some(
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("GuardianLaserVB"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+        );
+    }
+
+    fn build_entity_batches(
+        &mut self,
+        entities: &[EntityRenderSnapshot],
+        registries: &EngineRegistries,
+        atlas: &TextureAtlas,
+    ) -> Vec<(String, IndexedMeshBuffers)> {
+        if entities.is_empty() {
+            return Vec::new();
         }
 
         const ATLAS_ENTITY_BATCH_KEY: &str = "__atlas__";
@@ -2112,6 +2459,34 @@ impl WgpuRenderer {
             } else {
                 None
             };
+            let item_id = resolved_item_spec
+                .and_then(|s| s.split_whitespace().next())
+                .map(|tok| registries.resolve_alias(tok.trim()))
+                .unwrap_or("");
+            if item_id == crate::registry::RAM_MIC_ITEM_ID {
+                const RAM_MIC_BATCH_KEY: &str = "prop:cubex:ram_mic";
+                if !self.entity_tex_cache.contains_key(RAM_MIC_BATCH_KEY) {
+                    let pal = ram_mic_palette_image();
+                    let pw = pal.width().max(1);
+                    let ph = pal.height().max(1);
+                    let bg = Self::upload_single_layer_bind_group(
+                        &self.device,
+                        &self.queue,
+                        &self.tex_bind_group_layout,
+                        &pal,
+                    );
+                    self.entity_tex_cache
+                        .insert(RAM_MIC_BATCH_KEY.to_string(), (bg, pw, ph));
+                }
+                let (ev, ei) = build_dropped_ram_mic_mesh(ent);
+                if !ev.is_empty() && !ei.is_empty() {
+                    let entry = grouped.entry(RAM_MIC_BATCH_KEY.to_string()).or_default();
+                    let base = entry.0.len() as u32;
+                    entry.0.extend(ev);
+                    entry.1.extend(ei.into_iter().map(|idx| base + idx));
+                }
+                continue;
+            }
             let tex_key = if let Some(item_spec) = resolved_item_spec {
                 format!("item:{item_spec}")
             } else if !ent.texture_name.is_empty() {
@@ -2178,13 +2553,15 @@ impl WgpuRenderer {
             entry.1.extend(ei.into_iter().map(|idx| base + idx));
         }
 
+        let mut batches = Vec::with_capacity(grouped.len());
         for (tex_key, (verts, indices)) in grouped {
             if verts.is_empty() || indices.is_empty() {
                 continue;
             }
             let bufs = IndexedMeshBuffers::from_mesh(&self.device, "EntityBatch", &verts, &indices);
-            self.entity_draw_batches.push((tex_key, bufs));
+            batches.push((tex_key, bufs));
         }
+        batches
     }
 
     pub fn compute_panorama_camera(time_sec: f32, aspect: f32, center: Vec3) -> (Vec3, Mat4) {
@@ -2354,14 +2731,39 @@ impl WgpuRenderer {
     /// Render a single player's 3D viewport to an offscreen `RgbaImage` for PC-to-phone cloud streaming.
     pub fn render_stream_rgba(
         &mut self,
-        mut cam: ViewportCamera,
+        cam: ViewportCamera,
         width: u32,
         height: u32,
         time_of_day: f32,
         settings: &EngineSettings,
     ) -> anyhow::Result<RgbaImage> {
-        let w = width.max(16);
-        let h = height.max(16);
+        self.capture_viewport_with_egui_rgba(
+            cam,
+            width,
+            height,
+            time_of_day,
+            settings,
+            None,
+            None,
+            1.0,
+        )
+    }
+
+    /// Render a single 3D viewport with optional `egui` overlay into an offscreen target and read back an `RgbaImage`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_viewport_with_egui_rgba(
+        &mut self,
+        mut cam: ViewportCamera,
+        width: u32,
+        height: u32,
+        time_of_day: f32,
+        settings: &EngineSettings,
+        egui_ctx: Option<&egui::Context>,
+        egui_output: Option<egui::FullOutput>,
+        pixels_per_point: f32,
+    ) -> anyhow::Result<RgbaImage> {
+        let w = width.clamp(16, 2560);
+        let h = height.clamp(16, 2560);
         cam.viewport_px = [0, 0, w, h];
 
         let recreate_target = match self.stream_target {
@@ -2392,21 +2794,32 @@ impl WgpuRenderer {
         }
 
         self.write_viewport_uniforms(0, &cam, time_of_day, settings, false);
-        let aspect_sky = sky_color_for_tod(time_of_day);
+        let aspect_sky = sky_color_for_dimension(time_of_day, cam.dimension);
         let fog_dist = self.effective_fog_dist(settings);
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("CloudStreamEncoder"),
+                label: Some("OffscreenCaptureEncoder"),
             });
-        self.update_and_encode_shadows(&mut encoder, cam.cam_pos, time_of_day, settings);
+        if !cam.dimension.is_nether() {
+            self.update_and_encode_shadows(&mut encoder, cam.cam_pos, time_of_day, settings);
+        }
 
         let mut vis = 0u32;
         let mut draws = 0u32;
         {
             let (_, ref target_view, ref target_depth, _, _) =
                 *self.stream_target.as_ref().unwrap();
+            let part_buf = if egui_ctx.is_some() {
+                if cam.dimension.is_nether() {
+                    self.build_particle_buffers_from(&self.nether_particles, cam.cam_pos)
+                } else {
+                    self.build_particle_buffers_from(&self.particles, cam.cam_pos)
+                }
+            } else {
+                None
+            };
             self.encode_viewport_3d(
                 &mut encoder,
                 target_view,
@@ -2418,10 +2831,22 @@ impl WgpuRenderer {
                 true,
                 aspect_sky,
                 fog_dist,
-                None,
+                part_buf.as_ref(),
                 false,
                 &mut vis,
                 &mut draws,
+            );
+            Self::encode_egui_pass(
+                &self.device,
+                &self.queue,
+                &mut self.egui_renderer,
+                &mut encoder,
+                target_view,
+                w,
+                h,
+                egui_ctx,
+                egui_output,
+                pixels_per_point.max(0.5),
             );
         }
 
@@ -2483,7 +2908,7 @@ impl WgpuRenderer {
         readback.unmap();
 
         RgbaImage::from_raw(w, h, pixels)
-            .ok_or_else(|| anyhow::anyhow!("Failed to construct RgbaImage from cloud stream readback"))
+            .ok_or_else(|| anyhow::anyhow!("Failed to construct RgbaImage from viewport readback"))
     }
 
     #[inline]
@@ -2521,7 +2946,12 @@ impl WgpuRenderer {
         settings: &EngineSettings,
         bloom_hdr_active: bool,
     ) {
-        let palette = compute_sky_palette(time_of_day);
+        let is_nether = cam.dimension.is_nether();
+        let palette = if is_nether {
+            compute_nether_sky_palette()
+        } else {
+            compute_sky_palette(time_of_day)
+        };
         let aspect_sky = palette.horizon;
         let fog_dist = self.effective_fog_dist(settings);
         let sun_dir = palette.sun_dir;
@@ -2554,16 +2984,25 @@ impl WgpuRenderer {
         let wind_flag = if settings.wind_swaying_foliage { 1.0 } else { 0.0 };
         let bloom_flag = if bloom_hdr_active { 1.0 } else { 0.0 };
         let water_flag = if settings.waving_water { 1.0 } else { 0.0 };
-        let cloud_oct = settings.cloud_octaves() as f32;
+        let cloud_oct = if is_nether {
+            0.0
+        } else {
+            settings.cloud_octaves() as f32
+        };
         let proc_sky_flag = if settings.procedural_sky_clouds { 1.0 } else { 0.0 };
+        let dim_w = if is_nether { 1.0 } else { 0.0 };
         let uniform = CameraUniform {
             view_proj: cam.view_proj.to_cols_array_2d(),
-            camera_pos: [cam.cam_pos.x, cam.cam_pos.y, cam.cam_pos.z, 1.0],
+            camera_pos: [cam.cam_pos.x, cam.cam_pos.y, cam.cam_pos.z, dim_w],
             sun_dir_time: [sun_dir[0], sun_dir[1], sun_dir[2], elapsed_sec],
             fog_color_dist: [aspect_sky[0], aspect_sky[1], aspect_sky[2], fog_dist],
             flags: [
                 if settings.smooth_lighting { 1.0 } else { 0.0 },
-                if settings.dynamic_shadows { 1.0 } else { 0.0 },
+                if settings.dynamic_shadows && !is_nether {
+                    1.0
+                } else {
+                    0.0
+                },
                 water_flag,
                 settings.brightness,
             ],
@@ -2580,12 +3019,13 @@ impl WgpuRenderer {
         let cam_buffers = &self.viewport_cams[cam_buf_idx.min(3)];
         self.queue
             .write_buffer(&cam_buffers.camera_buffer, 0, bytemuck::bytes_of(&uniform));
-        let sky_uniform = SkyUniform::from_camera(
+        let sky_uniform = SkyUniform::from_camera_for_dimension(
             cam.view_proj,
             time_of_day,
             elapsed_sec,
             settings,
             bloom_hdr_active,
+            is_nether,
         );
         self.queue
             .write_buffer(&cam_buffers.sky_buffer, 0, bytemuck::bytes_of(&sky_uniform));
@@ -2618,7 +3058,7 @@ impl WgpuRenderer {
                 let vm_vp = vm_proj * model_mat;
                 let vm_uniform = CameraUniform {
                     view_proj: vm_vp.to_cols_array_2d(),
-                    camera_pos: [0.0, 0.0, 0.0, 1.0],
+                    camera_pos: [0.0, 0.0, 0.0, dim_w],
                     sun_dir_time: [sun_dir[0], sun_dir[1].max(0.25), sun_dir[2], elapsed_sec],
                     fog_color_dist: [aspect_sky[0], aspect_sky[1], aspect_sky[2], 10000.0],
                     flags: [0.0, 0.0, 0.0, settings.brightness],
@@ -2652,7 +3092,9 @@ impl WgpuRenderer {
         rpass: &mut wgpu::RenderPass<'a>,
         opaque_pipe: &'a wgpu::RenderPipeline,
         cam_bg: &'a wgpu::BindGroup,
+        skin_bg: Option<&'a wgpu::BindGroup>,
         body_buffers: &'a IndexedMeshBuffers,
+        crown_buffers: &'a IndexedMeshBuffers,
         held_buffers: &'a IndexedMeshBuffers,
         held_uses_atlas: bool,
         held_tex_bg: Option<&'a wgpu::BindGroup>,
@@ -2661,16 +3103,27 @@ impl WgpuRenderer {
         if body_buffers.index_count == 0 {
             return;
         }
-        if let (Some(ref vb), Some(ref ib), Some(ref skin_bg)) =
-            (&body_buffers.vb, &body_buffers.ib, &self.player_skin_tex_bg)
+        if let (Some(ref vb), Some(ref ib), Some(sbg)) =
+            (&body_buffers.vb, &body_buffers.ib, skin_bg)
         {
             rpass.set_pipeline(opaque_pipe);
             rpass.set_bind_group(0, cam_bg, &[]);
-            rpass.set_bind_group(1, skin_bg, &[]);
+            rpass.set_bind_group(1, sbg, &[]);
             rpass.set_vertex_buffer(0, vb.slice(..));
             rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             rpass.draw_indexed(0..body_buffers.index_count, 0, 0..1);
             *draw_calls += 1;
+        }
+        if crown_buffers.index_count > 0 {
+            if let (Some(ref cvb), Some(ref cib)) = (&crown_buffers.vb, &crown_buffers.ib) {
+                rpass.set_pipeline(opaque_pipe);
+                rpass.set_bind_group(0, cam_bg, &[]);
+                rpass.set_bind_group(1, &self.crown_palette_tex_bg, &[]);
+                rpass.set_vertex_buffer(0, cvb.slice(..));
+                rpass.set_index_buffer(cib.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..crown_buffers.index_count, 0, 0..1);
+                *draw_calls += 1;
+            }
         }
         if held_buffers.index_count > 0 {
             if let (Some(ref hvb), Some(ref hib)) = (&held_buffers.vb, &held_buffers.ib) {
@@ -2690,6 +3143,31 @@ impl WgpuRenderer {
             }
         }
         rpass.set_bind_group(1, &self.tex_bind_group, &[]);
+    }
+
+    fn draw_player_overlay_buffers<'a>(
+        &'a self,
+        rpass: &mut wgpu::RenderPass<'a>,
+        trans_pipe: &'a wgpu::RenderPipeline,
+        cam_bg: &'a wgpu::BindGroup,
+        skin_bg: Option<&'a wgpu::BindGroup>,
+        overlay_buffers: &'a IndexedMeshBuffers,
+        draw_calls: &mut u32,
+    ) {
+        if overlay_buffers.index_count == 0 {
+            return;
+        }
+        if let (Some(ref ovb), Some(ref oib), Some(sbg)) =
+            (&overlay_buffers.vb, &overlay_buffers.ib, skin_bg)
+        {
+            rpass.set_pipeline(trans_pipe);
+            rpass.set_bind_group(0, cam_bg, &[]);
+            rpass.set_bind_group(1, sbg, &[]);
+            rpass.set_vertex_buffer(0, ovb.slice(..));
+            rpass.set_index_buffer(oib.slice(..), wgpu::IndexFormat::Uint32);
+            rpass.draw_indexed(0..overlay_buffers.index_count, 0, 0..1);
+            *draw_calls += 1;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2733,8 +3211,13 @@ impl WgpuRenderer {
         let frustum = Frustum::from_view_proj(cam.view_proj);
         let max_dist_sq = (fog_dist + 24.0).powi(2);
 
-        let mut visible: Vec<&GpuChunkMesh> = Vec::with_capacity(self.chunk_meshes.len());
-        for m in self.chunk_meshes.values() {
+        let chunk_map = if cam.dimension.is_nether() {
+            &self.nether_chunk_meshes
+        } else {
+            &self.chunk_meshes
+        };
+        let mut visible: Vec<&GpuChunkMesh> = Vec::with_capacity(chunk_map.len());
+        for m in chunk_map.values() {
             let min = (m.chunk_pos * 16).as_vec3();
             let max = min + Vec3::splat(16.0);
             let center = min + Vec3::splat(8.0);
@@ -2816,7 +3299,9 @@ impl WgpuRenderer {
                     &mut rpass,
                     opaque_pipe,
                     cam_bg,
+                    self.skin_bind_group_for(&self.player_model.skin_id),
                     &self.player_body_buffers,
+                    &self.player_crown_buffers,
                     &self.player_held_buffers,
                     self.player_held_uses_atlas,
                     self.player_held_tex_bg.as_ref(),
@@ -2829,7 +3314,9 @@ impl WgpuRenderer {
                         &mut rpass,
                         opaque_pipe,
                         cam_bg,
+                        self.skin_bind_group_for(&peer.player_model.skin_id),
                         &peer.player_body_buffers,
+                        &peer.player_crown_buffers,
                         &peer.player_held_buffers,
                         peer.player_held_uses_atlas,
                         peer.player_held_tex_bg.as_ref(),
@@ -2837,22 +3324,31 @@ impl WgpuRenderer {
                     );
                 }
             }
-            // Draw all connected remote LAN players
-            for remote in self.remote_players.values() {
-                self.draw_player_mesh_buffers(
-                    &mut rpass,
-                    opaque_pipe,
-                    cam_bg,
-                    &remote.body_buffers,
-                    &remote.held_buffers,
-                    remote.held_uses_atlas,
-                    remote.held_tex_bg.as_ref(),
-                    &mut draw_calls,
-                );
+            if !cam.dimension.is_nether() {
+                // Draw all connected remote LAN players
+                for remote in self.remote_players.values() {
+                    self.draw_player_mesh_buffers(
+                        &mut rpass,
+                        opaque_pipe,
+                        cam_bg,
+                        self.skin_bind_group_for(&remote.model.skin_id),
+                        &remote.body_buffers,
+                        &remote.crown_buffers,
+                        &remote.held_buffers,
+                        remote.held_uses_atlas,
+                        remote.held_tex_bg.as_ref(),
+                        &mut draw_calls,
+                    );
+                }
             }
 
-            // Draw active 3D LuaEntity/mob batches (visible across all viewports)
-            for (tex_key, bufs) in &self.entity_draw_batches {
+            // Draw active 3D LuaEntity / NativeMob / Projectile batches for this dimension
+            let entity_batches = if cam.dimension.is_nether() {
+                &self.nether_entity_draw_batches
+            } else {
+                &self.entity_draw_batches
+            };
+            for (tex_key, bufs) in entity_batches {
                 if bufs.index_count == 0 {
                     continue;
                 }
@@ -2870,7 +3366,7 @@ impl WgpuRenderer {
                     draw_calls += 1;
                 }
             }
-            if !self.entity_draw_batches.is_empty() {
+            if !entity_batches.is_empty() {
                 rpass.set_bind_group(1, &self.tex_bind_group, &[]);
             }
 
@@ -2916,6 +3412,43 @@ impl WgpuRenderer {
                 }
             }
 
+            // Alpha-blended player skin overlays (1.125x head overlay & 64x64 outer layers)
+            if (cam.draw_local_player_mask & (1u8 << 0)) != 0 {
+                self.draw_player_overlay_buffers(
+                    &mut rpass,
+                    trans_pipe,
+                    cam_bg,
+                    self.skin_bind_group_for(&self.player_model.skin_id),
+                    &self.player_overlay_buffers,
+                    &mut draw_calls,
+                );
+            }
+            for (peer_idx, peer) in self.peers.iter().enumerate() {
+                if (cam.draw_local_player_mask & (1u8 << (peer_idx + 1))) != 0 {
+                    self.draw_player_overlay_buffers(
+                        &mut rpass,
+                        trans_pipe,
+                        cam_bg,
+                        self.skin_bind_group_for(&peer.player_model.skin_id),
+                        &peer.player_overlay_buffers,
+                        &mut draw_calls,
+                    );
+                }
+            }
+            if !cam.dimension.is_nether() {
+                for remote in self.remote_players.values() {
+                    self.draw_player_overlay_buffers(
+                        &mut rpass,
+                        trans_pipe,
+                        cam_bg,
+                        self.skin_bind_group_for(&remote.model.skin_id),
+                        &remote.overlay_buffers,
+                        &mut draw_calls,
+                    );
+                }
+            }
+            rpass.set_bind_group(1, &self.tex_bind_group, &[]);
+
             let (sel_vb, sel_cnt) = if let Some(peer) = peer_opt {
                 (&peer.selection_vb, peer.selection_vert_count)
             } else {
@@ -2927,6 +3460,15 @@ impl WgpuRenderer {
                     rpass.set_bind_group(0, cam_bg, &[]);
                     rpass.set_vertex_buffer(0, svb.slice(..));
                     rpass.draw(0..sel_cnt, 0..1);
+                    draw_calls += 1;
+                }
+            }
+            if !cam.dimension.is_nether() && self.laser_vert_count > 0 {
+                if let Some(ref lvb) = self.laser_vb {
+                    rpass.set_pipeline(line_pipe);
+                    rpass.set_bind_group(0, cam_bg, &[]);
+                    rpass.set_vertex_buffer(0, lvb.slice(..));
+                    rpass.draw(0..self.laser_vert_count, 0..1);
                     draw_calls += 1;
                 }
             }
@@ -2996,11 +3538,15 @@ impl WgpuRenderer {
         *out_draws += draw_calls;
     }
 
-    fn build_particle_buffers(&self, cam_pos: Vec3) -> Option<(wgpu::Buffer, wgpu::Buffer, u32)> {
-        if self.particles.particles.is_empty() {
+    fn build_particle_buffers_from(
+        &self,
+        sys: &ParticleSystem,
+        cam_pos: Vec3,
+    ) -> Option<(wgpu::Buffer, wgpu::Buffer, u32)> {
+        if sys.particles.is_empty() {
             return None;
         }
-        let (pverts, pindices) = self.particles.build_vertices(cam_pos);
+        let (pverts, pindices) = sys.build_vertices(cam_pos);
         if pindices.is_empty() {
             return None;
         }
@@ -3076,6 +3622,30 @@ impl WgpuRenderer {
         egui_output: Option<egui::FullOutput>,
         pixels_per_point: f32,
     ) -> anyhow::Result<()> {
+        self.render_frame_in_dimension(
+            cam_pos,
+            view_proj,
+            DimensionId::Overworld,
+            time_of_day,
+            settings,
+            egui_ctx,
+            egui_output,
+            pixels_per_point,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_frame_in_dimension(
+        &mut self,
+        cam_pos: Vec3,
+        view_proj: Mat4,
+        dimension: DimensionId,
+        time_of_day: f32,
+        settings: &EngineSettings,
+        egui_ctx: Option<&egui::Context>,
+        egui_output: Option<egui::FullOutput>,
+        pixels_per_point: f32,
+    ) -> anyhow::Result<()> {
         let w = self.surface_config.width.max(1);
         let h = self.surface_config.height.max(1);
         let mut mask = if self.show_player_model { 1u8 } else { 0u8 };
@@ -3093,6 +3663,7 @@ impl WgpuRenderer {
             player_slot: 0,
             draw_local_player_mask: mask,
             draw_viewmodel: self.show_viewmodel,
+            dimension,
         };
         self.render_viewports_frame(
             &[cam],
@@ -3143,9 +3714,14 @@ impl WgpuRenderer {
         for (idx, cam) in viewports.iter().take(4).enumerate() {
             self.write_viewport_uniforms(idx, cam, time_of_day, settings, use_bloom);
         }
-        let particle_buffers = viewports
-            .first()
-            .and_then(|c| self.build_particle_buffers(c.cam_pos));
+        let ow_particles = viewports
+            .iter()
+            .find(|c| !c.dimension.is_nether())
+            .and_then(|c| self.build_particle_buffers_from(&self.particles, c.cam_pos));
+        let nether_particles = viewports
+            .iter()
+            .find(|c| c.dimension.is_nether())
+            .and_then(|c| self.build_particle_buffers_from(&self.nether_particles, c.cam_pos));
 
         let surface_tex = if let Some(ref surf) = self.surface {
             match surf.get_current_texture() {
@@ -3174,11 +3750,15 @@ impl WgpuRenderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("CubexMultiViewportEncoder"),
         });
-        if let Some(first_cam) = viewports.first() {
-            self.update_and_encode_shadows(&mut encoder, first_cam.cam_pos, time_of_day, settings);
+        if let Some(first_ow) = viewports.iter().find(|c| !c.dimension.is_nether()) {
+            self.update_and_encode_shadows(&mut encoder, first_ow.cam_pos, time_of_day, settings);
         }
 
-        let aspect_sky = sky_color_for_tod(time_of_day);
+        let clear_dim = viewports
+            .first()
+            .map(|c| c.dimension)
+            .unwrap_or(DimensionId::Overworld);
+        let aspect_sky = sky_color_for_dimension(time_of_day, clear_dim);
         let fog_dist = self.effective_fog_dist(settings);
         let mut vis = 0u32;
         let mut draws = 0u32;
@@ -3209,6 +3789,12 @@ impl WgpuRenderer {
                 .ensure_targets(&self.device, &mut self.bloom_targets, w, h);
             let scene_view = &self.bloom_targets.as_ref().unwrap().scene_view;
             for (idx, cam) in viewports.iter().take(4).enumerate() {
+                let vp_sky = sky_color_for_dimension(time_of_day, cam.dimension);
+                let vp_parts = if cam.dimension.is_nether() {
+                    nether_particles.as_ref()
+                } else {
+                    ow_particles.as_ref()
+                };
                 self.encode_viewport_3d(
                     &mut encoder,
                     scene_view,
@@ -3218,9 +3804,9 @@ impl WgpuRenderer {
                     idx,
                     cam,
                     idx == 0,
-                    aspect_sky,
+                    vp_sky,
                     fog_dist,
-                    particle_buffers.as_ref(),
+                    vp_parts,
                     true,
                     &mut vis,
                     &mut draws,
@@ -3233,6 +3819,12 @@ impl WgpuRenderer {
         } else {
             self.bloom_targets = None;
             for (idx, cam) in viewports.iter().take(4).enumerate() {
+                let vp_sky = sky_color_for_dimension(time_of_day, cam.dimension);
+                let vp_parts = if cam.dimension.is_nether() {
+                    nether_particles.as_ref()
+                } else {
+                    ow_particles.as_ref()
+                };
                 self.encode_viewport_3d(
                     &mut encoder,
                     target_view,
@@ -3242,9 +3834,9 @@ impl WgpuRenderer {
                     idx,
                     cam,
                     idx == 0,
-                    aspect_sky,
+                    vp_sky,
                     fog_dist,
-                    particle_buffers.as_ref(),
+                    vp_parts,
                     false,
                     &mut vis,
                     &mut draws,
@@ -3315,9 +3907,14 @@ impl WgpuRenderer {
         for (idx, cam) in viewports.iter().take(4).enumerate() {
             self.write_viewport_uniforms(idx, cam, time_of_day, settings, use_bloom);
         }
-        let particle_buffers = viewports
-            .first()
-            .and_then(|c| self.build_particle_buffers(c.cam_pos));
+        let ow_particles = viewports
+            .iter()
+            .find(|c| !c.dimension.is_nether())
+            .and_then(|c| self.build_particle_buffers_from(&self.particles, c.cam_pos));
+        let nether_particles = viewports
+            .iter()
+            .find(|c| c.dimension.is_nether())
+            .and_then(|c| self.build_particle_buffers_from(&self.nether_particles, c.cam_pos));
 
         let surface_tex = match target.surface.get_current_texture() {
             Ok(t) => t,
@@ -3335,11 +3932,10 @@ impl WgpuRenderer {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("CubexSecondaryMonitorEncoder"),
         });
-        if let Some(first_cam) = viewports.first() {
-            self.update_and_encode_shadows(&mut encoder, first_cam.cam_pos, time_of_day, settings);
+        if let Some(first_ow) = viewports.iter().find(|c| !c.dimension.is_nether()) {
+            self.update_and_encode_shadows(&mut encoder, first_ow.cam_pos, time_of_day, settings);
         }
 
-        let aspect_sky = sky_color_for_tod(time_of_day);
         let fog_dist = self.effective_fog_dist(settings);
         let mut vis = 0u32;
         let mut draws = 0u32;
@@ -3348,6 +3944,12 @@ impl WgpuRenderer {
                 .ensure_targets(&self.device, &mut target.bloom_targets, w, h);
             let scene_view = &target.bloom_targets.as_ref().unwrap().scene_view;
             for (idx, cam) in viewports.iter().take(4).enumerate() {
+                let vp_sky = sky_color_for_dimension(time_of_day, cam.dimension);
+                let vp_parts = if cam.dimension.is_nether() {
+                    nether_particles.as_ref()
+                } else {
+                    ow_particles.as_ref()
+                };
                 self.encode_viewport_3d(
                     &mut encoder,
                     scene_view,
@@ -3357,9 +3959,9 @@ impl WgpuRenderer {
                     idx,
                     cam,
                     idx == 0,
-                    aspect_sky,
+                    vp_sky,
                     fog_dist,
-                    particle_buffers.as_ref(),
+                    vp_parts,
                     true,
                     &mut vis,
                     &mut draws,
@@ -3372,6 +3974,12 @@ impl WgpuRenderer {
         } else {
             target.bloom_targets = None;
             for (idx, cam) in viewports.iter().take(4).enumerate() {
+                let vp_sky = sky_color_for_dimension(time_of_day, cam.dimension);
+                let vp_parts = if cam.dimension.is_nether() {
+                    nether_particles.as_ref()
+                } else {
+                    ow_particles.as_ref()
+                };
                 self.encode_viewport_3d(
                     &mut encoder,
                     &target_view,
@@ -3381,9 +3989,9 @@ impl WgpuRenderer {
                     idx,
                     cam,
                     idx == 0,
-                    aspect_sky,
+                    vp_sky,
                     fog_dist,
-                    particle_buffers.as_ref(),
+                    vp_parts,
                     false,
                     &mut vis,
                     &mut draws,
@@ -3412,6 +4020,14 @@ impl WgpuRenderer {
 
 pub fn sky_color_for_tod(tod: f32) -> [f32; 3] {
     compute_sky_palette(tod).horizon
+}
+
+pub fn sky_color_for_dimension(tod: f32, dim: DimensionId) -> [f32; 3] {
+    if dim.is_nether() {
+        compute_nether_sky_palette().horizon
+    } else {
+        compute_sky_palette(tod).horizon
+    }
 }
 
 fn apply_player_hurt_flash(verts: &mut [mesher::VoxelVertex], hurt_flash: f32) {
@@ -3613,6 +4229,7 @@ mod tests {
                     player_slot: 0,
                     draw_local_player_mask: 0,
                     draw_viewmodel: false,
+                    dimension: DimensionId::Overworld,
                 },
                 ViewportCamera {
                     cam_pos: p2_eye,
@@ -3621,6 +4238,7 @@ mod tests {
                     player_slot: 1,
                     draw_local_player_mask: 1u8 << 0,
                     draw_viewmodel: true,
+                    dimension: DimensionId::Overworld,
                 },
                 0.35,
                 &EngineSettings::default(),
@@ -3639,6 +4257,7 @@ mod tests {
                     player_slot: 0,
                     draw_local_player_mask: 1u8 << 1,
                     draw_viewmodel: false,
+                    dimension: DimensionId::Overworld,
                 },
                 ViewportCamera {
                     cam_pos: p2_eye,
@@ -3647,6 +4266,7 @@ mod tests {
                     player_slot: 1,
                     draw_local_player_mask: 1u8 << 0,
                     draw_viewmodel: true,
+                    dimension: DimensionId::Overworld,
                 },
                 0.35,
                 &EngineSettings::default(),
@@ -3715,6 +4335,8 @@ mod tests {
             wield_item: String::new(),
             walk_phase: 1.0,
             walk_blend: 0.85,
+            anim_time: 1.0,
+            vel_y: 0.0,
             hurt_flash: 0.0,
             sky_light: 15,
             block_light: 0,
@@ -3772,6 +4394,7 @@ mod tests {
             player_slot: 0,
             draw_local_player_mask: 0,
             draw_viewmodel: false,
+            dimension: DimensionId::Overworld,
         };
         let cam2 = ViewportCamera {
             cam_pos: p2_eye,
@@ -3780,6 +4403,7 @@ mod tests {
             player_slot: 1,
             draw_local_player_mask: 0,
             draw_viewmodel: false,
+            dimension: DimensionId::Overworld,
         };
 
         renderer.update_entities(&[], &reg, &atlas);
@@ -3890,6 +4514,7 @@ mod tests {
                 player_slot: slot,
                 draw_local_player_mask: 0b1111 & !(1u8 << slot),
                 draw_viewmodel: false,
+                dimension: DimensionId::Overworld,
             }
         };
         let cams = [
@@ -3925,6 +4550,8 @@ mod tests {
             wield_item: String::new(),
             walk_phase: 0.5,
             walk_blend: 0.8,
+            anim_time: 0.5,
+            vel_y: 0.0,
             hurt_flash: 0.0,
             sky_light: 15,
             block_light: 0,
@@ -3942,6 +4569,8 @@ mod tests {
             wield_item: String::new(),
             walk_phase: 1.0,
             walk_blend: 0.9,
+            anim_time: 1.0,
+            vel_y: 0.0,
             hurt_flash: 0.0,
             sky_light: 15,
             block_light: 0,
@@ -4022,6 +4651,8 @@ mod tests {
             wield_item: String::new(),
             walk_phase: 0.0,
             walk_blend: 0.0,
+            anim_time: 0.0,
+            vel_y: 0.0,
             hurt_flash: 0.0,
             sky_light: 15,
             block_light: 0,
@@ -4038,6 +4669,7 @@ mod tests {
             player_slot: 0,
             draw_local_player_mask: 0,
             draw_viewmodel: false,
+            dimension: DimensionId::Overworld,
         };
 
         let img = renderer
@@ -4188,6 +4820,7 @@ mod tests {
             player_slot: 0,
             draw_local_player_mask: 0,
             draw_viewmodel: true,
+            dimension: DimensionId::Overworld,
         };
         let cam2 = ViewportCamera {
             cam_pos: Vec3::new(11.5, 4.0, 8.0),
@@ -4197,6 +4830,7 @@ mod tests {
             player_slot: 1,
             draw_local_player_mask: 0,
             draw_viewmodel: false,
+            dimension: DimensionId::Overworld,
         };
         renderer.resize(320, 180, false);
         assert!(!renderer.bloom_targets_allocated());
@@ -4371,6 +5005,7 @@ mod tests {
             player_slot: 0,
             draw_local_player_mask: 0,
             draw_viewmodel: false,
+            dimension: DimensionId::Overworld,
         };
         let cam2 = ViewportCamera {
             cam_pos: Vec3::new(11.5, 4.5, 13.0),
@@ -4379,6 +5014,7 @@ mod tests {
             player_slot: 1,
             draw_local_player_mask: 0,
             draw_viewmodel: false,
+            dimension: DimensionId::Overworld,
         };
         let split_img = renderer
             .render_split_to_headless_target(cam1, cam2, 0.50, &settings, None, None, 1.0)
@@ -4467,5 +5103,213 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn headless_carterpcs_skin_crown_and_ram_mic_render() {
+        let reg = EngineRegistries::new();
+        let atlas = TextureAtlas::build(&HashMap::new(), Path::new(""), None, &reg);
+        let skins_dir = crate::paths::EnginePaths::resolve().skins_dir;
+        let skins = crate::textures::list_available_skins(&skins_dir, &atlas.player_skin);
+        let carter = skins
+            .iter()
+            .find(|s| crate::textures::is_carterpcs_skin(&s.id))
+            .expect("carterpcs.png in assets/skins");
+
+        let Ok(mut renderer) = WgpuRenderer::new_headless(240, 180, &atlas) else {
+            return;
+        };
+        renderer.set_player_skin(0, &carter.id, &carter.image);
+        renderer.show_viewmodel = true;
+        renderer.update_viewmodel(
+            Some(crate::registry::RAM_MIC_ITEM_ID),
+            0,
+            0.016,
+            0.0,
+            true,
+            false,
+            false,
+            &reg,
+            &atlas,
+        );
+        assert!(renderer.viewmodel_index_count > 0);
+        assert!(
+            renderer
+                .viewmodel_mesh
+                .as_ref()
+                .is_some_and(|m| m.is_custom_prop),
+            "cubex:ram_mic viewmodel must use custom compound prop mesh"
+        );
+
+        renderer.update_player_model(
+            Vec3::new(8.5, 2.0, 8.5),
+            0.0,
+            0.0,
+            0.0,
+            false,
+            Some(crate::registry::RAM_MIC_ITEM_ID),
+            0.016,
+            &reg,
+            &atlas,
+        );
+        assert!(renderer.player_overlay_buffers.index_count > 0);
+        assert!(renderer.player_crown_buffers.index_count > 0);
+        assert!(renderer.player_held_buffers.index_count > 0);
+
+        let dropped_mic = EntityRenderSnapshot {
+            id: 99,
+            entity_name: "__builtin:item".into(),
+            pos: Vec3::new(8.0, 2.5, 9.2),
+            yaw: 0.0,
+            collisionbox: [-0.18, -0.18, -0.18, 0.18, 0.18, 0.18],
+            visual: "wielditem".into(),
+            visual_size: Vec3::splat(0.67),
+            mesh: String::new(),
+            texture_name: String::new(),
+            wield_item: crate::registry::RAM_MIC_ITEM_ID.into(),
+            walk_phase: 0.3,
+            walk_blend: 0.0,
+            anim_time: 0.3,
+            vel_y: 0.0,
+            hurt_flash: 0.0,
+            sky_light: 15,
+            block_light: 0,
+        };
+        renderer.update_entities(&[dropped_mic], &reg, &atlas);
+        assert!(
+            renderer
+                .entity_draw_batches
+                .iter()
+                .any(|(k, b)| k == "prop:cubex:ram_mic" && b.index_count > 36),
+            "Dropped cubex:ram_mic must batch its dedicated 3D compound mesh"
+        );
+
+        let eye = Vec3::new(8.5, 3.2, 11.5);
+        let vp = Mat4::perspective_rh(72.0f32.to_radians(), 240.0 / 180.0, 0.1, 100.0)
+            * Mat4::look_at_rh(eye, Vec3::new(8.5, 3.0, 8.5), Vec3::Y);
+        let cams = [ViewportCamera {
+            cam_pos: eye,
+            view_proj: vp,
+            viewport_px: [0, 0, 240, 180],
+            player_slot: 0,
+            draw_local_player_mask: 1u8 << 0,
+            draw_viewmodel: true,
+            dimension: DimensionId::Overworld,
+        }];
+        let img = renderer
+            .render_viewports_to_headless_target(
+                &cams,
+                0.35,
+                &EngineSettings::default(),
+                None,
+                None,
+                1.0,
+            )
+            .expect("headless render with CarterPCs skin & RAM mic");
+        assert_eq!(img.dimensions(), (240, 180));
+        assert!(img.pixels().any(|p| p.0[3] == 255 && (p.0[0] > 0 || p.0[1] > 0 || p.0[2] > 0)));
+    }
+
+    #[test]
+    fn headless_mipmaps_anisotropy_and_splitscreen_overworld_nether_render() {
+        let mut reg = EngineRegistries::new();
+        let stone = reg.register_node(NodeDef {
+            name: "mcl_core:stone".into(),
+            drawtype: DrawType::Normal,
+            walkable: true,
+            ..Default::default()
+        });
+        let netherrack = reg.register_node(NodeDef {
+            name: "mcl_nether:netherrack".into(),
+            drawtype: DrawType::Normal,
+            walkable: true,
+            ..Default::default()
+        });
+        let portal_id = reg.get_content_id(crate::registry::NETHER_PORTAL_NODE_ID);
+        let atlas = TextureAtlas::build(&HashMap::new(), Path::new(""), None, &reg);
+        let mut renderer =
+            WgpuRenderer::new_headless(320, 180, &atlas).expect("headless wgpu split-dim");
+
+        // Live anisotropy switches (Off -> 4x -> 8x)
+        assert_eq!(renderer.anisotropy_quality(), AnisotropyQuality::Off);
+        renderer.set_anisotropy_quality(AnisotropyQuality::X4);
+        assert_eq!(renderer.anisotropy_quality(), AnisotropyQuality::X4);
+        renderer.set_anisotropy_quality(AnisotropyQuality::X8);
+        assert_eq!(renderer.anisotropy_quality(), AnisotropyQuality::X8);
+
+        let dir = std::env::temp_dir().join("cubex_headless_split_ow_nether");
+        let _ = std::fs::remove_dir_all(&dir);
+        let ow = WorldStore::new(&dir, 777);
+        let nw = WorldStore::new_for_dimension(
+            &dir,
+            777,
+            DimensionId::Nether,
+            crate::world::WorldGenType::Default,
+            crate::world::Difficulty::Normal,
+            crate::world::Gamerules::default(),
+            "Survival",
+        );
+
+        let mut ch_ow = Chunk::new(IVec3::ZERO);
+        ch_ow.set(8, 2, 8, stone, 15, 0);
+        ch_ow.set(8, 3, 8, portal_id, 15, 0);
+        ow.insert_chunk(ch_ow);
+        ow.mark_priority_dirty_with_neighbors(IVec3::new(8, 2, 8));
+        renderer.remesh_priority_chunks_now(&ow, &reg, &atlas, true);
+
+        let mut ch_nw = Chunk::new(IVec3::ZERO);
+        ch_nw.param1.fill(0);
+        ch_nw.set(8, 2, 8, netherrack, 0xA0, 0);
+        ch_nw.set(8, 3, 8, portal_id, 0xB0, 1);
+        nw.insert_chunk(ch_nw);
+        nw.mark_priority_dirty_with_neighbors(IVec3::new(8, 2, 8));
+        renderer.remesh_priority_chunks_now(&nw, &reg, &atlas, true);
+        assert!(renderer.chunk_meshes.contains_key(&IVec3::ZERO));
+        assert!(renderer.nether_chunk_meshes.contains_key(&IVec3::ZERO));
+
+        let eye = Vec3::new(8.5, 4.5, 13.0);
+        let proj = Mat4::perspective_rh(72.0f32.to_radians(), 160.0 / 180.0, 0.1, 100.0);
+        let vp = proj * Mat4::look_at_rh(eye, Vec3::new(8.5, 3.0, 8.5), Vec3::Y);
+        let cams = [
+            ViewportCamera {
+                cam_pos: eye,
+                view_proj: vp,
+                viewport_px: [0, 0, 160, 180],
+                player_slot: 0,
+                draw_local_player_mask: 0,
+                draw_viewmodel: false,
+                dimension: DimensionId::Overworld,
+            },
+            ViewportCamera {
+                cam_pos: eye,
+                view_proj: vp,
+                viewport_px: [160, 0, 160, 180],
+                player_slot: 1,
+                draw_local_player_mask: 0,
+                draw_viewmodel: false,
+                dimension: DimensionId::Nether,
+            },
+        ];
+        let mut settings = EngineSettings::default();
+        settings.apply_graphics_preset(crate::config::GraphicsPreset::Balanced);
+        let img = renderer
+            .render_viewports_to_headless_target(&cams, 0.50, &settings, None, None, 1.0)
+            .expect("split Overworld+Nether headless render");
+        assert_eq!(img.dimensions(), (320, 180));
+
+        // Upper-left sky must be Overworld noon blue (B > R), upper-right must be Nether crimson (R > B)
+        let ow_sky = img.get_pixel(40, 12).0;
+        let nw_sky = img.get_pixel(240, 12).0;
+        assert!(
+            ow_sky[2] > ow_sky[0] && ow_sky[2] > 120,
+            "Expected Overworld blue sky on left half, got {:?}",
+            ow_sky
+        );
+        assert!(
+            nw_sky[0] > nw_sky[2] && nw_sky[0] < 130,
+            "Expected dark crimson Nether dome on right half, got {:?}",
+            nw_sky
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

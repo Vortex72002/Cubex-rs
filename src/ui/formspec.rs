@@ -68,6 +68,16 @@ pub struct ParsedFormspec {
     pub elements: Vec<FormElement>,
 }
 
+impl Default for ParsedFormspec {
+    fn default() -> Self {
+        Self {
+            version: 4,
+            size: [11.75, 9.6],
+            elements: Vec::new(),
+        }
+    }
+}
+
 /// Cursor holding an item stack currently picked up by the player inside an inventory UI.
 #[derive(Debug, Clone, Default)]
 pub struct InventoryCursor {
@@ -1350,7 +1360,7 @@ pub fn render_formspec_interactive(
                                         );
                                         paint_item_in_slot(p, srect, tid, &item.name, item.count, item.wear);
                                         if hovered {
-                                            hover_tooltip = Some(build_item_tooltip(&item.name, fctx.registries));
+                                            hover_tooltip = Some(build_item_stack_tooltip(item, fctx.registries));
                                         }
                                     }
                                 }
@@ -1846,6 +1856,46 @@ fn resolve_texture_id(
         (Some(c), None) => c.get_cached(&key),
         _ => None,
     }
+}
+
+fn build_item_stack_tooltip(stack: &ItemStackData, registries: Option<&EngineRegistries>) -> String {
+    let custom_desc = stack
+        .meta
+        .read()
+        .fields
+        .get("description")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(desc) = custom_desc {
+        return desc;
+    }
+    build_item_tooltip(&stack.name, registries)
+}
+
+/// Build an interactive 27-slot chest formspec (`nodemeta:x,y,z;main`) paired with the player's
+/// 36-slot inventory and `listring[]` Shift-click quick-transfer support.
+pub fn build_loot_chest_formspec(pos: IVec3, title: &str) -> String {
+    let clean_raw = if title.trim().is_empty() {
+        "Loot Chest"
+    } else {
+        title.trim()
+    };
+    let clean_title: String = clean_raw
+        .chars()
+        .filter(|c| !matches!(c, '[' | ']' | ';'))
+        .collect();
+    format!(
+        "formspec_version[4]size[11.75,10.65]\
+         label[0.375,0.38;{clean_title}]\
+         list[nodemeta:{},{},{};main;0.375,0.85;9,3;0]\
+         label[0.375,4.7;Inventory]\
+         list[current_player;main;0.375,5.1;9,3;9]\
+         list[current_player;main;0.375,9.1;9,1;0]\
+         listring[nodemeta:{},{},{};main]\
+         listring[current_player;main]\
+         button_exit[9.1,0.18;2.25,0.52;close;Close]",
+        pos.x, pos.y, pos.z, pos.x, pos.y, pos.z
+    )
 }
 
 fn build_item_tooltip(item_name: &str, registries: Option<&EngineRegistries>) -> String {

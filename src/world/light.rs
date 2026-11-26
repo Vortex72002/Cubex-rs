@@ -312,7 +312,9 @@ fn propagate_world_light_inner(
                 let wz = cz * 16 + lz as i32;
                 let above_pos = IVec3::new(wx, (max_cy + 1) * 16, wz);
                 let (above_id, above_p1, _) = world.get_node(above_pos);
-                let mut sky = if above_id == CONTENT_IGNORE {
+                let mut sky = if !world.has_skylight() {
+                    0
+                } else if above_id == CONTENT_IGNORE {
                     if max_cy >= -2 { LIGHT_SUN } else { 0 }
                 } else {
                     get_sky_light(above_p1)
@@ -332,8 +334,15 @@ fn propagate_world_light_inner(
                         let wy = cy * 16 + ly as i32;
                         let wpos = IVec3::new(wx, wy, wz);
 
-                        sky = vertical_sky_step(sky, id, registries);
-                        let new_sky = if sky > 0 && is_light_propagating(id, registries) {
+                        sky = if world.has_skylight() {
+                            vertical_sky_step(sky, id, registries)
+                        } else {
+                            0
+                        };
+                        let new_sky = if world.has_skylight()
+                            && sky > 0
+                            && is_light_propagating(id, registries)
+                        {
                             sky
                         } else {
                             0
@@ -392,7 +401,9 @@ fn propagate_world_light_inner(
         }
     }
 
-    spread_channel_bfs(world, registries, &mut sky_bfs, false, &mut touched);
+    if world.has_skylight() {
+        spread_channel_bfs(world, registries, &mut sky_bfs, false, &mut touched);
+    }
     spread_channel_bfs(world, registries, &mut block_bfs, true, &mut touched);
 
     if !touched.is_empty() {
@@ -516,8 +527,8 @@ pub fn relight_around_pos(
 ) -> Vec<IVec3> {
     let mut modified_chunks = HashSet::new();
 
-    // 1. Update Sky channel (including vertical sunlight column directly below `pos`)
-    {
+    // 1. Update Sky channel (including vertical sunlight column directly below `pos`, Overworld only)
+    if world.has_skylight() {
         let mut unlight: [Vec<IVec3>; 16] = Default::default();
         let mut relight: VecDeque<(IVec3, u8)> = VecDeque::new();
         let mut unlighted_set: HashSet<IVec3> = HashSet::new();
@@ -653,6 +664,8 @@ pub fn relight_around_pos(
         }
 
         spread_channel_bfs(world, registries, &mut relight, false, &mut modified_chunks);
+    } else {
+        set_world_channel(world, pos, LightChannel::Sky, 0, &mut modified_chunks);
     }
 
     // 2. Update Artificial Block channel (torches, lava, glowstone, etc.)

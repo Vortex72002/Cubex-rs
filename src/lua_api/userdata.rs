@@ -1197,6 +1197,7 @@ pub struct ObjectState {
     pub has_dropped_death_items: bool,
     pub spawn_invuln_timer: f32,
     pub last_death_cause: String,
+    pub dimension: crate::world::dimension::DimensionId,
 }
 
 /// Offset between Cubex world voxel bounds `[ix..ix+1]` and Luanti voxel centers `[ix-0.5..ix+0.5]`.
@@ -1287,6 +1288,7 @@ impl ObjectState {
             has_dropped_death_items: false,
             spawn_invuln_timer: 0.0,
             last_death_cause: String::new(),
+            dimension: crate::world::dimension::DimensionId::Overworld,
         }
     }
 
@@ -1375,6 +1377,7 @@ impl ObjectState {
             has_dropped_death_items: false,
             spawn_invuln_timer: 0.0,
             last_death_cause: String::new(),
+            dimension: crate::world::dimension::DimensionId::Overworld,
         }
     }
 
@@ -1610,7 +1613,7 @@ fn apply_player_hp_change_in_lua(
     target_hp: i32,
     reason_val: Option<Value>,
 ) -> LuaResult<()> {
-    let (old_hp, hp_max, already_dead, invuln_active, death_pos) = {
+    let (old_hp, hp_max, already_dead, invuln_active, death_pos, cur_pos, cur_hunger) = {
         let g = state.read();
         (
             g.hp,
@@ -1618,6 +1621,8 @@ fn apply_player_hp_change_in_lua(
             g.is_dead,
             g.spawn_invuln_timer > 0.0,
             cubex_to_lua_pos(g.pos),
+            g.pos,
+            g.hunger,
         )
     };
     if already_dead {
@@ -1639,6 +1644,17 @@ fn apply_player_hp_change_in_lua(
     let reason_type = extract_effective_hp_reason(&reason_tbl);
     if top_reason_type == "in_wall" || reason_type == "in_wall" {
         return Ok(());
+    }
+    if (top_reason_type == "starve" || reason_type == "starve") && cur_hunger > 0 {
+        return Ok(());
+    }
+    if (top_reason_type == "node_damage" || reason_type == "node_damage") && hp_change < 0 {
+        if let Ok(node_name) = reason_tbl.get::<String>("node") {
+            let empty_groups = std::collections::HashMap::new();
+            if crate::registry::is_safe_terrain_node(&node_name, &empty_groups) {
+                return Ok(());
+            }
+        }
     }
     if invuln_active && hp_change < 0 {
         return Ok(());
@@ -1687,6 +1703,22 @@ fn apply_player_hp_change_in_lua(
         g.hp_dirty_from_lua = true;
         if new_hp < old_hp {
             g.hurt_flash = 0.25;
+            let src = match reason_type.trim().to_ascii_lowercase().as_str() {
+                "fall" => crate::physics::DamageSource::Fall,
+                "in_wall" => crate::physics::DamageSource::Suffocation,
+                "node_damage" | "hot_floor" | "cactus" | "lava" | "fire" | "sweet_berry"
+                | "freeze" => crate::physics::DamageSource::NodeDamage,
+                "starve" => crate::physics::DamageSource::Starvation,
+                _ => crate::physics::DamageSource::Mob,
+            };
+            crate::physics::log_player_damage(
+                src,
+                old_hp - new_hp,
+                old_hp,
+                new_hp,
+                cur_pos,
+                &format!("lua:{reason_type}"),
+            );
         }
         if dying_now {
             g.is_dead = true;

@@ -1,7 +1,7 @@
 use glam::{EulerRot, Mat4, Quat, Vec2, Vec3};
-use image::RgbaImage;
+use image::{Rgba, RgbaImage};
 
-use crate::registry::{DrawType, EngineRegistries, NodeDef, CONTENT_UNKNOWN};
+use crate::registry::{DrawType, EngineRegistries, NodeDef, CONTENT_UNKNOWN, RAM_MIC_ITEM_ID};
 use crate::render::mesher::{emit_box, VoxelVertex};
 use crate::textures::TextureAtlas;
 
@@ -14,6 +14,7 @@ pub struct ViewmodelMesh {
     pub texture: Option<RgbaImage>,
     pub is_node_block: bool,
     pub is_arm: bool,
+    pub is_custom_prop: bool,
 }
 
 /// First-person viewmodel animation state machine (port of Luanti `camera.cpp` & `wieldmesh.cpp`).
@@ -168,6 +169,8 @@ impl ViewmodelState {
     pub fn model_matrix(&self, mesh: &ViewmodelMesh) -> Mat4 {
         let mut pos = if mesh.is_arm {
             Vec3::new(0.56, -0.52, -0.78)
+        } else if mesh.is_custom_prop {
+            Vec3::new(0.52, -0.34, -0.82)
         } else if mesh.is_node_block {
             Vec3::new(0.58, -0.48, -0.92)
         } else {
@@ -186,6 +189,8 @@ impl ViewmodelState {
 
         let base_rot = if mesh.is_arm {
             Quat::from_euler(EulerRot::YXZ, -0.35, -0.65, 0.30)
+        } else if mesh.is_custom_prop {
+            Quat::from_euler(EulerRot::YXZ, -0.42, -0.14, 0.08)
         } else if mesh.is_node_block {
             Quat::from_euler(EulerRot::YXZ, 0.785, -0.15, 0.0)
         } else {
@@ -220,6 +225,8 @@ impl ViewmodelState {
 
         let scale = if mesh.is_arm {
             Vec3::splat(1.0)
+        } else if mesh.is_custom_prop {
+            Vec3::splat(0.95)
         } else if mesh.is_node_block {
             Vec3::splat(0.38)
         } else {
@@ -338,6 +345,7 @@ pub fn create_extruded_mesh(img: &RgbaImage) -> ViewmodelMesh {
         texture: Some(img.clone()),
         is_node_block: false,
         is_arm: false,
+        is_custom_prop: false,
     }
 }
 
@@ -378,13 +386,18 @@ pub fn create_flat_item_mesh(img: &RgbaImage) -> ViewmodelMesh {
         texture: Some(img.clone()),
         is_node_block: false,
         is_arm: false,
+        is_custom_prop: false,
     }
 }
 
-/// Build a 3D first-person empty right arm textured from the player's 64x32 (or 64x64) skin.
+/// Build a 3D first-person empty right arm textured from the player's skin (supports 64x32, 128x64, and 64x64).
 pub fn create_arm_mesh(skin: &RgbaImage) -> ViewmodelMesh {
-    let w = skin.width().max(64) as f32;
-    let h = skin.height().max(32) as f32;
+    let w = 64.0f32;
+    let h = if skin.width() > 0 && skin.height() >= skin.width() {
+        64.0f32
+    } else {
+        32.0f32
+    };
     let hw = 0.14f32;
     let hh = 0.44f32;
     let hd = 0.14f32;
@@ -442,6 +455,179 @@ pub fn create_arm_mesh(skin: &RgbaImage) -> ViewmodelMesh {
         texture: Some(skin.clone()),
         is_node_block: false,
         is_arm: true,
+        is_custom_prop: false,
+    }
+}
+
+/// sRGB palette colors for `cubex:ram_mic` (`#1C9846` PCB, `#16181C` DRAM, `#F2CA36` gold, `#20232A` mic).
+pub const RAM_MIC_PALETTE: [[u8; 4]; 8] = [
+    [0x1C, 0x98, 0x46, 255], // 0: Green DDR4 PCB body
+    [0x16, 0x18, 0x1C, 255], // 1: Dark DRAM memory chips
+    [0xF2, 0xCA, 0x36, 255], // 2: Bright gold edge-connector pins
+    [0x20, 0x23, 0x2A, 255], // 3: Matte-black wireless mic body
+    [0x2E, 0x33, 0x3D, 255], // 4: Rear clip & top mic grille
+    [0xF5, 0xF7, 0xFA, 255], // 5: Crisp white square logo
+    [0x30, 0xF8, 0x60, 255], // 6: Glowing green LED status pixel
+    [0x13, 0x6E, 0x32, 255], // 7: PCB dark green edge trace
+];
+
+/// Build an 8x1 sRGB palette texture so hardware texture sampling preserves rich colors without gamma washout.
+pub fn ram_mic_palette_image() -> RgbaImage {
+    let mut img = RgbaImage::new(RAM_MIC_PALETTE.len() as u32, 1);
+    for (i, col) in RAM_MIC_PALETTE.iter().enumerate() {
+        img.put_pixel(i as u32, 0, Rgba(*col));
+    }
+    img
+}
+
+fn push_palette_box(
+    verts: &mut Vec<VoxelVertex>,
+    indices: &mut Vec<u32>,
+    min: [f32; 3],
+    max: [f32; 3],
+    palette_idx: u8,
+    emissive: bool,
+) {
+    let [x0, y0, z0] = min;
+    let [x1, y1, z1] = max;
+    let faces: [(u8, [[f32; 3]; 4]); 6] = [
+        (0, [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]]),
+        (1, [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]]),
+        (2, [[x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0]]),
+        (3, [[x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1]]),
+        (4, [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]]),
+        (5, [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]]),
+    ];
+    let u = (palette_idx as f32 + 0.5) / RAM_MIC_PALETTE.len() as f32;
+    let uv = [u, 0.5f32];
+    let tint = [255u8, 255, 255, 255];
+    for (fdir, pts) in faces {
+        let mut packed = VoxelVertex::pack(0, fdir, 15, if emissive { 15 } else { 0 }, 3, false, false);
+        if emissive {
+            packed |= VoxelVertex::FLAG_EMISSIVE;
+        }
+        let base = verts.len() as u32;
+        for pos in pts {
+            verts.push(VoxelVertex { pos, uv, packed, tint });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+/// Build the 3D compound mesh for `cubex:ram_mic`: a green DDR4 PCB stick (`0.15 x 0.52 x 0.035`)
+/// with dark DRAM chips on the lower half, bright gold edge-connector pins along one edge, and a
+/// matte-black square wireless clip-on mic (`0.19 x 0.19 x 0.085`) with white logo and green LED.
+pub fn create_ram_mic_mesh() -> ViewmodelMesh {
+    let mut verts = Vec::with_capacity(24 * 16);
+    let mut indices = Vec::with_capacity(36 * 16);
+
+    // 1. Green DDR4 PCB handle (0.15 wide x 0.52 tall x 0.035 thick)
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [-0.075, -0.26, -0.0175],
+        [0.075, 0.26, 0.0175],
+        0,
+        false,
+    );
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [-0.076, -0.24, -0.010],
+        [-0.064, 0.24, 0.010],
+        7,
+        false,
+    );
+
+    // 2. Gold edge-connector pin banks along +X edge split around the DDR4 key notch
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [0.068, -0.25, -0.019],
+        [0.086, -0.03, 0.019],
+        2,
+        false,
+    );
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [0.068, 0.01, -0.019],
+        [0.086, 0.25, 0.019],
+        2,
+        false,
+    );
+
+    // 3. Dark DRAM memory ICs on lower half (3 front +Z, 3 back -Z)
+    for cy in [-0.205f32, -0.125, -0.045] {
+        push_palette_box(
+            &mut verts,
+            &mut indices,
+            [-0.048, cy - 0.030, 0.016],
+            [0.032, cy + 0.030, 0.027],
+            1,
+            false,
+        );
+        push_palette_box(
+            &mut verts,
+            &mut indices,
+            [-0.048, cy - 0.030, -0.027],
+            [0.032, cy + 0.030, -0.016],
+            1,
+            false,
+        );
+    }
+
+    // 4. Matte-black square wireless clip-on mic (0.19 x 0.19 x 0.085) clamped onto upper half
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [-0.095, 0.03, -0.022],
+        [0.095, 0.22, 0.063],
+        3,
+        false,
+    );
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [-0.052, 0.05, -0.042],
+        [0.052, 0.19, -0.018],
+        4,
+        false,
+    );
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [-0.042, 0.22, -0.008],
+        [0.042, 0.240, 0.048],
+        4,
+        false,
+    );
+
+    // 5. White logo square & glowing green status LED pixel on front face
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [-0.042, 0.082, 0.062],
+        [0.042, 0.166, 0.069],
+        5,
+        false,
+    );
+    push_palette_box(
+        &mut verts,
+        &mut indices,
+        [0.052, 0.174, 0.062],
+        [0.076, 0.198, 0.070],
+        6,
+        true,
+    );
+
+    ViewmodelMesh {
+        verts,
+        indices,
+        texture: Some(ram_mic_palette_image()),
+        is_node_block: false,
+        is_arm: false,
+        is_custom_prop: true,
     }
 }
 
@@ -520,6 +706,7 @@ pub fn create_held_node_mesh(def: &NodeDef, registries: &EngineRegistries, atlas
         texture: None,
         is_node_block: true,
         is_arm: false,
+        is_custom_prop: false,
     }
 }
 
@@ -538,13 +725,30 @@ pub fn build_viewmodel_mesh_ex(
     registries: &EngineRegistries,
     atlas: &TextureAtlas,
 ) -> ViewmodelMesh {
+    build_viewmodel_mesh_with_skin(held_item_name, extruded, None, registries, atlas)
+}
+
+pub fn build_viewmodel_mesh_with_skin(
+    held_item_name: Option<&str>,
+    extruded: bool,
+    custom_skin: Option<&RgbaImage>,
+    registries: &EngineRegistries,
+    atlas: &TextureAtlas,
+) -> ViewmodelMesh {
+    let fallback_arm = || match custom_skin {
+        Some(skin) => create_arm_mesh(skin),
+        None => create_arm_mesh(&atlas.get_player_skin_rgba()),
+    };
     let raw = held_item_name.unwrap_or("").trim();
     let base = raw.split_whitespace().next().unwrap_or("");
     if base.is_empty() {
-        return create_arm_mesh(&atlas.get_player_skin_rgba());
+        return fallback_arm();
     }
 
     let resolved = registries.resolve_alias(base);
+    if resolved == RAM_MIC_ITEM_ID {
+        return create_ram_mic_mesh();
+    }
     let cid = registries.get_content_id(resolved);
     let is_node = registries
         .get_item_def(resolved)
@@ -580,7 +784,7 @@ pub fn build_viewmodel_mesh_ex(
         };
     }
 
-    create_arm_mesh(&atlas.get_player_skin_rgba())
+    fallback_arm()
 }
 
 #[cfg(test)]

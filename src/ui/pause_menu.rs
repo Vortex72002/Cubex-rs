@@ -88,7 +88,7 @@ pub fn render_pause_menu(
     settings: &mut EngineSettings,
     config: &mut MinetestConfig,
     gamemode: GameMode,
-    tunnel: &PlayitTunnelManager,
+    _tunnel: &PlayitTunnelManager,
     packs: &[ResourcePackInfo],
     chunks_loaded: usize,
 ) -> PauseAction {
@@ -148,25 +148,34 @@ pub fn render_pause_menu(
                     }
                     y += 52.0;
 
-                    let lan_lbl = match state.lan_active_addr {
-                        Some(ref addr) => format!("LAN Open: {addr} (Click to Stop)"),
-                        None => "Open to LAN (Port 8090)".into(),
+                    let split_lbl = if settings.coop_mode.is_active() {
+                        format!(
+                            "Local Split-Screen: {} ({}P)",
+                            settings.coop_mode.label(),
+                            settings.coop_mode.active_player_count(settings.coop_player_count)
+                        )
+                    } else {
+                        "Local Split-Screen...".to_string()
                     };
-                    if place_btn(ui, theme, cx - w * 0.5, y, w, 42.0, &lan_lbl, state.lan_active_addr.is_some()) {
-                        action = if state.lan_active_addr.is_some() {
-                            PauseAction::StopLan
-                        } else {
-                            PauseAction::OpenToLan
-                        };
+                    if place_btn(
+                        ui,
+                        theme,
+                        cx - w * 0.5,
+                        y,
+                        w,
+                        42.0,
+                        &split_lbl,
+                        settings.coop_mode.is_active(),
+                    ) {
+                        state.page = PausePage::Coop;
                     }
                     y += 52.0;
 
-                    if place_btn(ui, theme, cx - w * 0.5, y, half, 42.0, "Open to WAN (playit.gg)", false) {
-                        state.copied_notice = None;
-                        state.page = PausePage::WanInvite;
-                    }
-                    if place_btn(ui, theme, cx + gap * 0.5, y, half, 42.0, "World & Cheats", false) {
+                    if place_btn(ui, theme, cx - w * 0.5, y, half, 42.0, "World & Cheats", false) {
                         state.page = PausePage::WorldCheats;
+                    }
+                    if place_btn(ui, theme, cx + gap * 0.5, y, half, 42.0, "Skins...", is_carterpcs_skin(&settings.player_skin)) {
+                        state.page = PausePage::Skins;
                     }
                     y += 52.0;
 
@@ -178,21 +187,17 @@ pub fn render_pause_menu(
                     }
                     y += 52.0;
 
-                    let coop_lbl = if settings.coop_mode.is_active() {
-                        format!(
-                            "Co-op: {} ({}P)",
-                            settings.coop_mode.label(),
-                            settings.coop_mode.active_player_count(settings.coop_player_count)
-                        )
-                    } else {
-                        "Local Co-op...".to_string()
-                    };
-                    if place_btn(ui, theme, cx - w * 0.5, y, half, 42.0, &coop_lbl, settings.coop_mode.is_active()) {
-                        state.page = PausePage::Coop;
-                    }
-                    if place_btn(ui, theme, cx + gap * 0.5, y, half, 42.0, "Skins...", is_carterpcs_skin(&settings.player_skin)) {
-                        state.page = PausePage::Skins;
-                    }
+                    let _ = place_btn_enabled(
+                        ui,
+                        theme,
+                        cx - w * 0.5,
+                        y,
+                        w,
+                        42.0,
+                        "WAN Multiplayer (Coming Soon)",
+                        false,
+                        false,
+                    );
                     y += 54.0;
 
                     if place_btn(ui, theme, cx - w * 0.5, y, w, 44.0, "Save and Quit to Title", false) {
@@ -488,7 +493,7 @@ pub fn render_pause_menu(
                 }
 
                 PausePage::Coop => {
-                    mc_shadow_text(p, Pos2::new(cx, top), Align2::CENTER_CENTER, "Local Co-op & PS5 Controllers", 22.0, Color32::WHITE);
+                    mc_shadow_text(p, Pos2::new(cx, top), Align2::CENTER_CENTER, "Local Split-Screen & Controllers", 22.0, Color32::WHITE);
                     let w = (screen.width() * 0.64).clamp(540.0, 680.0);
                     let col_w = (w - 16.0) * 0.5;
                     let panel_r = Rect::from_min_max(
@@ -636,70 +641,52 @@ pub fn render_pause_menu(
                 }
 
                 PausePage::WanInvite => {
-                    mc_shadow_text(p, Pos2::new(cx, top), Align2::CENTER_CENTER, "Open to WAN (playit.gg)", 22.0, Color32::from_rgb(85, 255, 85));
-                    let st = tunnel.status.lock().clone();
-                    let w = (screen.width() * 0.62).clamp(500.0, 640.0);
-                    let card = Rect::from_min_size(Pos2::new(cx - w * 0.5, top + 36.0), Vec2::new(w, 150.0));
-                    p.rect_filled(card, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 200));
-                    p.rect_stroke(card, 0.0, Stroke::new(1.5, Color32::from_rgb(90, 90, 90)), egui::StrokeKind::Inside);
-
-                    mc_shadow_text(p, Pos2::new(cx, card.top() + 24.0), Align2::CENTER_CENTER, &format!("Status: {}", st.status_text), 14.0, Color32::WHITE);
-                    let addr_txt = if st.public_address.is_empty() {
-                        "Public Address: (Not started)".into()
-                    } else {
-                        format!("Public Address: {}", st.public_address)
-                    };
-                    mc_shadow_text(p, Pos2::new(cx, card.top() + 56.0), Align2::CENTER_CENTER, &addr_txt, 14.0, Color32::from_rgb(255, 255, 120));
-                    let code_txt = if st.invite_code.is_empty() {
-                        "Invite Code: CBX-...".into()
-                    } else {
-                        format!("Invite Code: {}", st.invite_code)
-                    };
-                    mc_shadow_text(p, Pos2::new(cx, card.top() + 88.0), Align2::CENTER_CENTER, &code_txt, 14.0, Color32::from_rgb(85, 255, 255));
-                    if !st.claim_url.is_empty() {
-                        mc_shadow_text(p, Pos2::new(cx, card.top() + 120.0), Align2::CENTER_CENTER, &format!("Claim URL: {}", st.claim_url), 12.0, Color32::from_rgb(255, 180, 90));
-                    } else if let Some(ref notice) = state.copied_notice {
-                        mc_shadow_text(p, Pos2::new(cx, card.top() + 120.0), Align2::CENTER_CENTER, notice, 12.0, Color32::from_rgb(85, 255, 85));
-                    }
-
-                    let y = card.bottom() + 14.0;
-                    let bw = (w - 16.0) / 3.0;
-                    if st.running {
-                        if place_btn(ui, theme, cx - w * 0.5, y, bw, 40.0, "Stop Tunnel", false) {
-                            action = PauseAction::StopTunnel;
-                        }
-                    } else if place_btn(ui, theme, cx - w * 0.5, y, bw, 40.0, "Start Playit Tunnel", true) {
-                        action = PauseAction::StartTunnel;
-                    }
-                    if place_btn_enabled(ui, theme, cx - bw * 0.5, y, bw, 40.0, "Copy Invite Code", false, !st.invite_code.is_empty()) {
-                        ctx.copy_text(st.invite_code.clone());
-                        state.copied_notice = Some("Copied CBX-... invite code to clipboard!".into());
-                    }
-                    if place_btn_enabled(ui, theme, cx + w * 0.5 - bw, y, bw, 40.0, "Copy Address", false, !st.public_address.is_empty()) {
-                        ctx.copy_text(st.public_address.clone());
-                        state.copied_notice = Some("Copied public address to clipboard!".into());
-                    }
-
-                    // Live tunnel logs
-                    let log_r = Rect::from_min_max(
-                        Pos2::new(cx - w * 0.5, y + 54.0),
-                        Pos2::new(cx + w * 0.5, (screen.bottom() - 78.0).max(y + 110.0)),
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, top),
+                        Align2::CENTER_CENTER,
+                        "WAN Multiplayer (Coming Soon)",
+                        22.0,
+                        Color32::from_rgb(200, 200, 200),
                     );
-                    p.rect_filled(log_r, 0.0, Color32::from_rgba_unmultiplied(8, 8, 8, 220));
-                    p.rect_stroke(log_r, 0.0, Stroke::new(1.0, Color32::from_rgb(70, 70, 70)), egui::StrokeKind::Inside);
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(log_r.shrink(6.0)), |ui| {
-                        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                            if st.logs.is_empty() {
-                                ui.label(egui::RichText::new("Playit tunnel logs will appear here...").color(Color32::GRAY));
-                            } else {
-                                for line in &st.logs {
-                                    ui.label(egui::RichText::new(line).monospace().size(11.5).color(Color32::from_rgb(85, 255, 85)));
-                                }
-                            }
-                        });
-                    });
+                    let w = (screen.width() * 0.56).clamp(460.0, 600.0);
+                    let card = Rect::from_min_size(
+                        Pos2::new(cx - w * 0.5, top + 48.0),
+                        Vec2::new(w, 150.0),
+                    );
+                    p.rect_filled(card, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 200));
+                    p.rect_stroke(
+                        card,
+                        0.0,
+                        Stroke::new(1.5, Color32::from_rgb(90, 90, 90)),
+                        egui::StrokeKind::Inside,
+                    );
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, card.top() + 36.0),
+                        Align2::CENTER_CENTER,
+                        "WAN Multiplayer (Coming Soon)",
+                        17.0,
+                        Color32::from_rgb(255, 220, 120),
+                    );
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, card.top() + 76.0),
+                        Align2::CENTER_CENTER,
+                        "Use Local Split-Screen to play together on one machine.",
+                        13.5,
+                        Color32::from_rgb(160, 240, 160),
+                    );
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, card.top() + 106.0),
+                        Align2::CENTER_CENTER,
+                        "WAN and dedicated server multiplayer are on the roadmap.",
+                        13.0,
+                        Color32::LIGHT_GRAY,
+                    );
 
-                    if place_btn(ui, theme, cx - 120.0, screen.bottom() - 62.0, 240.0, 42.0, "Done", false) {
+                    if place_btn(ui, theme, cx - 120.0, screen.bottom() - 62.0, 240.0, 42.0, "Done", true) {
                         state.page = PausePage::Main;
                     }
                 }

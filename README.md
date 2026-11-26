@@ -14,8 +14,8 @@
 - **Survival Gameplay & Entities:**
   - Swept AABB voxel physics with `0.6`-block stepheight, sneaking edge-catch, swimming, ladders, hunger/saturation/exhaustion, right-click food eating, natural health regeneration, and starvation.
   - Physical mobs and falling nodes (`__builtin:falling_node`) with straight-down gravity and solid grid re-placement, plus `Keep Inventory on Death` (on by default) and per-viewport respawn screens.
-- **Multiplayer, Split-Screen & Streaming:**
-  - Local co-op up to 4 players across split-screen viewports or multiple displays, gamepad support (`gilrs`), touch controls, LAN discovery (`--port 8090` browser stream / game networking), `CBX-...` invites, `playit.gg` integration, and `--dedicated` headless server mode.
+- **Local Split-Screen:**
+  - Local co-op for up to 4 players across split-screen viewports or multiple displays, gamepad support (`gilrs`), and touch controls.
 
 ## Prerequisites
 
@@ -38,10 +38,11 @@ cargo build --release
 
 # Automated headless playtest and screenshot capture (writes playtest_out/*.png)
 ./target/release/cubex-rs --playtest
-
-# Dedicated headless multiplayer server
-./target/release/cubex-rs --dedicated --port 30000
 ```
+
+## Roadmap
+
+- **WAN / Dedicated Server Multiplayer:** Remote server browser, direct connect, `CBX-...` invite codes, `playit.gg` WAN tunneling, and `--dedicated` headless multiplayer server hosting.
 
 ## Controls (Default)
 

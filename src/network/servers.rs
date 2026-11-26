@@ -48,57 +48,16 @@ impl ServerEntry {
 }
 
 pub fn featured_servers() -> Vec<ServerEntry> {
-    vec![
-        ServerEntry {
-            name: "Mineclonia Survival Realm".into(),
-            host: "mineclonia.org".into(),
-            port: 30000,
-            motd: "§2§lMineclonia Official §r§7- §eSurvival & Exploration\n§bVillages • Nether • End Dragon • 100% Free".into(),
-            featured: true,
-            category: "Survival".into(),
-            players_online: 0,
-            players_max: 60,
-            ping_ms: None,
-            online: false,
-            is_lan: false,
-        },
-        ServerEntry {
-            name: "Clamity Anarchy & PvP".into(),
-            host: "clamity.net".into(),
-            port: 30000,
-            motd: "§c§lClamity PvP §r§8| §6Mineclonia Combat Arena\n§7Clans • Crystal PvP • Custom Kits & Events".into(),
-            featured: true,
-            category: "PvP".into(),
-            players_online: 0,
-            players_max: 100,
-            ping_ms: None,
-            online: false,
-            is_lan: false,
-        },
-        ServerEntry {
-            name: "Skyblock Islands Hub".into(),
-            host: "skyblock.luanti.org".into(),
-            port: 30000,
-            motd: "§b§lSkyblock Horizons §r§7- §aFloating Island Survival\n§eCo-op Islands • Economy • Daily Challenges".into(),
-            featured: true,
-            category: "Skyblock".into(),
-            players_online: 0,
-            players_max: 80,
-            ping_ms: None,
-            online: false,
-            is_lan: false,
-        },
-    ]
+    Vec::new()
 }
 
 pub fn load_servers(path: &Path) -> Vec<ServerEntry> {
     let mut all = Vec::new();
     if let Ok(raw) = std::fs::read_to_string(path) {
         if let Ok(custom) = serde_json::from_str::<Vec<ServerEntry>>(&raw) {
-            all.extend(custom);
+            all.extend(custom.into_iter().filter(|s| !s.featured));
         }
     }
-    all.extend(featured_servers());
     all
 }
 
@@ -239,4 +198,22 @@ pub fn generate_server_icon_rgba16(seed_text: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{featured_servers, load_servers};
+    use std::path::PathBuf;
+
+    #[test]
+    fn featured_servers_returns_empty() {
+        assert!(featured_servers().is_empty());
+    }
+
+    #[test]
+    fn load_servers_missing_file_returns_empty() {
+        let missing = PathBuf::from("/tmp/cubex_nonexistent_servers_list_test.json");
+        let _ = std::fs::remove_file(&missing);
+        assert!(load_servers(&missing).is_empty());
+    }
 }

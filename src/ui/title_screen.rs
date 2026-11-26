@@ -3,17 +3,15 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::config::EngineSettings;
-use crate::network::invite::decode_invite;
-use crate::network::motd::motd_to_layout_job;
 use crate::network::servers::{
-    generate_server_icon_rgba16, load_servers, ping_server, save_custom_servers, scan_lan_servers,
-    AsyncServerRefresh, ServerEntry,
+    generate_server_icon_rgba16, load_servers, ping_server, scan_lan_servers, AsyncServerRefresh,
+    ServerEntry,
 };
 use crate::network::tunnel::PlayitTunnelManager;
 use crate::textures::{is_carterpcs_skin, ResourcePackInfo, SkinInfo, TextureAtlas};
 use crate::ui::theme::{
-    mc_button, mc_button_green, mc_button_styled, mc_button_with_sound, mc_shadow_text,
-    mc_slider_f32, paint_dirt_screen_bg, paint_player_skin_card, ItemIconCache, McTheme,
+    mc_button, mc_button_styled, mc_button_with_sound, mc_shadow_text, mc_slider_f32,
+    paint_dirt_screen_bg, paint_player_skin_card, ItemIconCache, McTheme,
 };
 use crate::world::{
     create_world_ex, delete_world, list_worlds, next_default_world_name, Difficulty, Gamerules,
@@ -104,8 +102,8 @@ impl TitleScreenState {
             servers: load_servers(servers_file),
             selected_server: 0,
             direct_addr: String::new(),
-            add_name: "My Server".into(),
-            add_addr: "127.0.0.1:8090".into(),
+            add_name: String::new(),
+            add_addr: String::new(),
             show_add_modal: false,
             status_msg: String::new(),
             copied_notice: None,
@@ -181,10 +179,10 @@ pub fn render_title_screen_with_atlas(
     state: &mut TitleScreenState,
     settings: &mut EngineSettings,
     worlds_dir: &std::path::Path,
-    servers_file: &std::path::Path,
+    _servers_file: &std::path::Path,
     packs: &[ResourcePackInfo],
-    tunnel: &PlayitTunnelManager,
-    tokio_rt: &tokio::runtime::Runtime,
+    _tunnel: &PlayitTunnelManager,
+    _tokio_rt: &tokio::runtime::Runtime,
     atlas: Option<&TextureAtlas>,
     time_sec: f32,
 ) -> TitleAction {
@@ -278,15 +276,39 @@ pub fn render_title_screen_with_atlas(
                         state.page = TitlePage::Singleplayer;
                     }
                     y += 54.0;
-                    if btn(ui, theme, cx - bw * 0.5, y, bw, 46.0, "Multiplayer", false) {
-                        state.page = TitlePage::Multiplayer;
-                        state.trigger_async_refresh(tokio_rt);
+                    let split_lbl = if settings.coop_mode.is_active() {
+                        format!(
+                            "Local Split-Screen ({}P)",
+                            settings.coop_mode.active_player_count(settings.coop_player_count)
+                        )
+                    } else {
+                        "Local Split-Screen".into()
+                    };
+                    if btn(
+                        ui,
+                        theme,
+                        cx - bw * 0.5,
+                        y,
+                        bw,
+                        46.0,
+                        &split_lbl,
+                        settings.coop_mode.is_active(),
+                    ) {
+                        state.options_tab = TitleOptionsTab::Coop;
+                        state.page = TitlePage::Options;
                     }
                     y += 54.0;
-                    if btn(ui, theme, cx - bw * 0.5, y, bw, 46.0, "Host WAN (playit.gg)", false) {
-                        state.copied_notice = None;
-                        state.page = TitlePage::HostWan;
-                    }
+                    let _ = btn_en(
+                        ui,
+                        theme,
+                        cx - bw * 0.5,
+                        y,
+                        bw,
+                        46.0,
+                        "WAN Multiplayer (Coming Soon)",
+                        false,
+                        false,
+                    );
                     y += 68.0;
 
                     let gap = 8.0;
@@ -599,228 +621,58 @@ pub fn render_title_screen_with_atlas(
                     }
                 }
 
-                TitlePage::Multiplayer => {
-                    mc_shadow_text(p, Pos2::new(cx, 34.0), Align2::CENTER_CENTER, "Play Multiplayer", 22.0, Color32::WHITE);
-                    let list_w = (screen.width() * 0.72).clamp(620.0, 820.0);
-                    let list_rect = Rect::from_min_max(
-                        Pos2::new(cx - list_w * 0.5, 72.0),
-                        Pos2::new(cx + list_w * 0.5, screen.bottom() - 144.0),
+                TitlePage::Multiplayer | TitlePage::HostWan => {
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, 34.0),
+                        Align2::CENTER_CENTER,
+                        "WAN Multiplayer (Coming Soon)",
+                        22.0,
+                        Color32::from_rgb(200, 200, 200),
                     );
-                    p.rect_filled(list_rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 180));
-                    p.rect_stroke(list_rect, 0.0, Stroke::new(2.0, Color32::from_rgb(70, 70, 70)), egui::StrokeKind::Inside);
-
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(list_rect.shrink(6.0)), |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for (i, s) in state.servers.iter().enumerate() {
-                                let sel = i == state.selected_server;
-                                let (row_r, resp) = ui.allocate_exact_size(Vec2::new(list_rect.width() - 24.0, 74.0), egui::Sense::click());
-                                if sel {
-                                    ui.painter().rect_filled(row_r, 0.0, Color32::from_rgba_unmultiplied(40, 60, 100, 150));
-                                    ui.painter().rect_stroke(row_r, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
-                                }
-
-                                // 64x64 pixel-crisp server icon
-                                let icon_rgba = generate_server_icon_rgba16(&s.icon_seed());
-                                let tid = state.icons.get_or_insert_server_icon(ctx, &s.icon_seed(), &icon_rgba);
-                                ui.painter().image(
-                                    tid,
-                                    Rect::from_min_size(row_r.min + Vec2::new(6.0, 5.0), Vec2::splat(64.0)),
-                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
-                                );
-
-                                let title = if s.is_lan {
-                                    format!("{} [LAN]", s.name)
-                                } else if s.featured {
-                                    format!("{} [{}]", s.name, s.category)
-                                } else {
-                                    s.name.clone()
-                                };
-                                mc_shadow_text(ui.painter(), row_r.min + Vec2::new(80.0, 14.0), Align2::LEFT_CENTER, &title, 15.0, Color32::WHITE);
-
-                                let job = motd_to_layout_job(&s.motd, 12.0);
-                                let galley = ui.fonts(|f| f.layout_job(job));
-                                ui.painter().galley(row_r.min + Vec2::new(80.0, 28.0), galley, Color32::GRAY);
-
-                                // Player count + ping ms + 5 signal bars
-                                let players_txt = format!("{}/{}", s.players_online, s.players_max);
-                                mc_shadow_text(ui.painter(), Pos2::new(row_r.right() - 88.0, row_r.top() + 14.0), Align2::RIGHT_CENTER, &players_txt, 11.5, Color32::LIGHT_GRAY);
-                                let ping_txt = s.ping_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "---".into());
-                                mc_shadow_text(ui.painter(), Pos2::new(row_r.right() - 42.0, row_r.top() + 14.0), Align2::RIGHT_CENTER, &ping_txt, 11.0, Color32::LIGHT_GRAY);
-
-                                let bars = s.signal_bars();
-                                for b in 0..5 {
-                                    let bh = 4.0 + b as f32 * 3.0;
-                                    let bx = row_r.right() - 34.0 + b as f32 * 5.0;
-                                    let by = row_r.top() + 22.0 - bh;
-                                    let col = if b < bars {
-                                        if bars >= 4 { Color32::GREEN } else if bars >= 2 { Color32::YELLOW } else { Color32::RED }
-                                    } else {
-                                        Color32::DARK_GRAY
-                                    };
-                                    ui.painter().rect_filled(Rect::from_min_size(Pos2::new(bx, by), Vec2::new(3.0, bh)), 0.0, col);
-                                }
-
-                                if resp.clicked() {
-                                    state.selected_server = i;
-                                }
-                                if resp.double_clicked() {
-                                    action = TitleAction::JoinServer(s.host.clone(), s.port);
-                                }
-                            }
-                        });
-                    });
-
-                    // Status + Direct connect bar
-                    if !state.status_msg.is_empty() {
-                        mc_shadow_text(p, Pos2::new(cx, screen.bottom() - 134.0), Align2::CENTER_CENTER, &state.status_msg, 12.0, Color32::from_rgb(255, 160, 80));
-                    }
-                    let d_r = Rect::from_min_size(Pos2::new(cx - list_w * 0.5, screen.bottom() - 122.0), Vec2::new(list_w - 200.0, 30.0));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(d_r), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Direct / CBX-:").color(Color32::WHITE));
-                            ui.add(egui::TextEdit::singleline(&mut state.direct_addr).hint_text("host:8090 or CBX-..."));
-                        });
-                    });
-                    if btn(ui, theme, cx + list_w * 0.5 - 190.0, screen.bottom() - 124.0, 190.0, 32.0, "Direct Connect", true) {
-                        if let Ok((h, pt)) = decode_invite(&state.direct_addr) {
-                            state.status_msg.clear();
-                            action = TitleAction::JoinServer(h, pt);
-                        } else {
-                            state.status_msg = "Invalid host:port or CBX-... invite code".into();
-                        }
-                    }
-
-                    let by = screen.bottom() - 82.0;
-                    let bw = (list_w - 32.0) / 5.0;
-                    if btn(ui, theme, cx - list_w * 0.5, by, bw, 38.0, "Join Server", true) {
-                        if let Some(s) = state.servers.get(state.selected_server) {
-                            action = TitleAction::JoinServer(s.host.clone(), s.port);
-                        }
-                    }
-                    if btn(ui, theme, cx - list_w * 0.5 + bw + 8.0, by, bw, 38.0, "Add Server", false) {
-                        state.show_add_modal = !state.show_add_modal;
-                    }
-                    let can_del_srv = state
-                        .servers
-                        .get(state.selected_server)
-                        .map(|s| !s.featured && !s.is_lan)
-                        .unwrap_or(false);
-                    if btn_en(ui, theme, cx - list_w * 0.5 + (bw + 8.0) * 2.0, by, bw, 38.0, "Delete", false, can_del_srv) {
-                        if state.selected_server < state.servers.len() {
-                            state.servers.remove(state.selected_server);
-                            if state.selected_server >= state.servers.len() && !state.servers.is_empty() {
-                                state.selected_server = state.servers.len() - 1;
-                            }
-                            save_custom_servers(servers_file, &state.servers);
-                        }
-                    }
-                    let refreshing = *state.server_refresher.in_progress.lock();
-                    let ref_lbl = if refreshing { "Scanning..." } else { "Refresh" };
-                    if btn(ui, theme, cx - list_w * 0.5 + (bw + 8.0) * 3.0, by, bw, 38.0, ref_lbl, false) {
-                        state.trigger_async_refresh(tokio_rt);
-                    }
-                    if btn(ui, theme, cx + list_w * 0.5 - bw, by, bw, 38.0, "Cancel", false) {
-                        state.show_add_modal = false;
-                        state.page = TitlePage::Home;
-                    }
-
-                    // Add Server modal
-                    if state.show_add_modal {
-                        let modal = Rect::from_center_size(screen.center(), Vec2::new(460.0, 220.0));
-                        p.rect_filled(screen, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
-                        p.rect_filled(modal, 0.0, Color32::from_rgb(36, 36, 40));
-                        p.rect_stroke(modal, 0.0, Stroke::new(2.0, Color32::WHITE), egui::StrokeKind::Inside);
-                        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(modal.shrink(16.0)), |ui| {
-                            ui.label(egui::RichText::new("Add Server (supports host:port or CBX-...)").strong().color(Color32::WHITE));
-                            ui.add_space(6.0);
-                            ui.label("Server Name:");
-                            ui.text_edit_singleline(&mut state.add_name);
-                            ui.label("Address / CBX Invite:");
-                            ui.text_edit_singleline(&mut state.add_addr);
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                if mc_button_green(ui, theme, "Save", 180.0, 36.0).clicked() {
-                                    if let Ok((h, pt)) = decode_invite(&state.add_addr) {
-                                        state.servers.insert(
-                                            0,
-                                            ServerEntry {
-                                                name: if state.add_name.trim().is_empty() { h.clone() } else { state.add_name.trim().to_string() },
-                                                host: h.clone(),
-                                                port: pt,
-                                                motd: format!("§a{h}:{pt}\n§7Custom Cubex Server"),
-                                                featured: false,
-                                                category: "Custom".into(),
-                                                players_online: 0,
-                                                players_max: 20,
-                                                ping_ms: None,
-                                                online: false,
-                                                is_lan: false,
-                                            },
-                                        );
-                                        save_custom_servers(servers_file, &state.servers);
-                                        state.show_add_modal = false;
-                                        state.trigger_async_refresh(tokio_rt);
-                                    } else {
-                                        state.status_msg = "Invalid server address or CBX code".into();
-                                    }
-                                }
-                                if mc_button(ui, theme, "Cancel", 180.0, 36.0).clicked() {
-                                    state.show_add_modal = false;
-                                }
-                            });
-                        });
-                    }
-                }
-
-                TitlePage::HostWan => {
-                    mc_shadow_text(p, Pos2::new(cx, 34.0), Align2::CENTER_CENTER, "Host WAN (playit.gg)", 22.0, Color32::from_rgb(85, 255, 85));
-                    let st = tunnel.status.lock().clone();
-                    let w = (screen.width() * 0.62).clamp(520.0, 640.0);
-                    let card = Rect::from_min_size(Pos2::new(cx - w * 0.5, 82.0), Vec2::new(w, 150.0));
+                    let w = (screen.width() * 0.56).clamp(460.0, 620.0);
+                    let card = Rect::from_center_size(
+                        Pos2::new(cx, screen.center().y - 30.0),
+                        Vec2::new(w, 160.0),
+                    );
                     p.rect_filled(card, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 195));
-                    p.rect_stroke(card, 0.0, Stroke::new(1.5, Color32::from_rgb(80, 80, 80)), egui::StrokeKind::Inside);
-                    mc_shadow_text(p, Pos2::new(cx, card.top() + 24.0), Align2::CENTER_CENTER, &format!("Status: {}", st.status_text), 15.0, Color32::WHITE);
-                    mc_shadow_text(p, Pos2::new(cx, card.top() + 58.0), Align2::CENTER_CENTER, &format!("Public Address: {}", st.public_address), 14.0, Color32::YELLOW);
-                    mc_shadow_text(p, Pos2::new(cx, card.top() + 92.0), Align2::CENTER_CENTER, &format!("Invite Code: {}", st.invite_code), 14.0, Color32::from_rgb(85, 255, 255));
-                    if !st.claim_url.is_empty() {
-                        mc_shadow_text(p, Pos2::new(cx, card.top() + 124.0), Align2::CENTER_CENTER, &format!("Claim URL: {}", st.claim_url), 12.0, Color32::from_rgb(255, 180, 85));
-                    } else if let Some(ref notice) = state.copied_notice {
-                        mc_shadow_text(p, Pos2::new(cx, card.top() + 124.0), Align2::CENTER_CENTER, notice, 12.0, Color32::from_rgb(85, 255, 85));
-                    }
-
-                    let y = card.bottom() + 14.0;
-                    let bw = (w - 16.0) / 3.0;
-                    if st.running {
-                        if btn(ui, theme, cx - w * 0.5, y, bw, 42.0, "Stop Tunnel", false) {
-                            action = TitleAction::StopTunnel;
-                        }
-                    } else if btn(ui, theme, cx - w * 0.5, y, bw, 42.0, "Start Playit Tunnel", true) {
-                        action = TitleAction::StartTunnel;
-                    }
-                    if btn_en(ui, theme, cx - bw * 0.5, y, bw, 42.0, "Copy Invite Code", false, !st.invite_code.is_empty()) {
-                        ctx.copy_text(st.invite_code.clone());
-                        state.copied_notice = Some("Copied CBX-... invite code!".into());
-                    }
-                    if btn_en(ui, theme, cx + w * 0.5 - bw, y, bw, 42.0, "Copy Address", false, !st.public_address.is_empty()) {
-                        ctx.copy_text(st.public_address.clone());
-                        state.copied_notice = Some("Copied public address!".into());
-                    }
-
-                    let log_r = Rect::from_min_max(
-                        Pos2::new(cx - w * 0.5, y + 54.0),
-                        Pos2::new(cx + w * 0.5, (screen.bottom() - 104.0).max(y + 110.0)),
+                    p.rect_stroke(
+                        card,
+                        0.0,
+                        Stroke::new(1.5, Color32::from_rgb(90, 90, 90)),
+                        egui::StrokeKind::Inside,
                     );
-                    p.rect_filled(log_r, 0.0, Color32::from_rgba_unmultiplied(8, 8, 8, 220));
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(log_r.shrink(6.0)), |ui| {
-                        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                            for line in &st.logs {
-                                ui.label(egui::RichText::new(line).monospace().size(11.5).color(Color32::from_rgb(85, 255, 85)));
-                            }
-                        });
-                    });
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, card.top() + 36.0),
+                        Align2::CENTER_CENTER,
+                        "WAN Multiplayer (Coming Soon)",
+                        17.0,
+                        Color32::from_rgb(255, 220, 120),
+                    );
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, card.top() + 76.0),
+                        Align2::CENTER_CENTER,
+                        "Local Split-Screen is ready now for up to 4 players.",
+                        13.5,
+                        Color32::from_rgb(160, 240, 160),
+                    );
+                    mc_shadow_text(
+                        p,
+                        Pos2::new(cx, card.top() + 106.0),
+                        Align2::CENTER_CENTER,
+                        "WAN and dedicated server multiplayer are planned on the roadmap.",
+                        13.0,
+                        Color32::LIGHT_GRAY,
+                    );
 
-                    if btn(ui, theme, cx - 120.0, screen.bottom() - 68.0, 240.0, 42.0, "Done", false) {
+                    let by = card.bottom() + 24.0;
+                    if btn(ui, theme, cx - 230.0, by, 220.0, 42.0, "Open Local Split-Screen", true) {
+                        state.options_tab = TitleOptionsTab::Coop;
+                        state.page = TitlePage::Options;
+                    }
+                    if btn(ui, theme, cx + 10.0, by, 220.0, 42.0, "Back to Title", false) {
                         state.page = TitlePage::Home;
                     }
                 }
@@ -833,7 +685,7 @@ pub fn render_title_screen_with_atlas(
                         ("Video", TitleOptionsTab::Video),
                         ("Audio", TitleOptionsTab::Audio),
                         ("Controls", TitleOptionsTab::Controls),
-                        ("Co-op & Gamepad", TitleOptionsTab::Coop),
+                        ("Split-Screen", TitleOptionsTab::Coop),
                     ];
                     let tab_w = (w - 32.0) / tabs.len() as f32;
                     for (idx, (lbl, tab)) in tabs.iter().enumerate() {

@@ -1,0 +1,8 @@
+/target
+/playtest_out
+*.log
+*.tmp
+*.bak
+*~
+.DS_Store
+Thumbs.db

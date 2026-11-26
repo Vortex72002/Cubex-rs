@@ -1,3 +1,5 @@
+> **Early Beta:** `cubex-rs` is currently in active Beta. Core survival, Overworld/Nether, Mineclonia modding, and local split-screen work today; **The End** dimension and full **WAN multiplayer** (`CBX-...` invites / `playit.gg` / `--dedicated`) are still in progress.
+
 # Cubex-RS
 
 `cubex-rs` is a native Linux Rust voxel engine powered by `winit`, `wgpu` (Vulkan), `egui`, `rayon`, and embedded LuaJIT (`mlua` vendored). It implements the Luanti / Mineclonia Lua modding API (`core.*` / `minetest.*`) so Mineclonia mods, resource packs, schemas, and entities run directly on native GPU rendering.

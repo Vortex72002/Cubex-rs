@@ -129,13 +129,18 @@ pub fn run_static_audit(
 
         if def.walkable && !is_liquid_node(def) && def.drawtype != DrawType::Airlike {
             let boxes = world_collision_boxes(IVec3::ZERO, def.id, 0, &dummy_world, reg);
+            let strict_pos = def.collision_box.box_type == "regular"
+                && def.collision_box.fixed.is_empty()
+                && def.collision_boxes.is_empty();
             let valid = !boxes.is_empty()
                 && boxes.iter().all(|b| {
                     b.min.is_finite()
                         && b.max.is_finite()
-                        && b.max.x > b.min.x
-                        && b.max.y > b.min.y
-                        && b.max.z > b.min.z
+                        && if strict_pos {
+                            b.max.x > b.min.x && b.max.y > b.min.y && b.max.z > b.min.z
+                        } else {
+                            b.max.x >= b.min.x && b.max.y >= b.min.y && b.max.z >= b.min.z
+                        }
                 });
             if !valid {
                 empty_aabb_blocks.push(def.name.clone());

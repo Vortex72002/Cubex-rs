@@ -919,9 +919,9 @@ fn stamp_bastion_remnant(
                     bsp
                 } else if dy == 12 && corner {
                     bsg
-                } else if (h_mod ^ (dy as u64 * 17)) % 19 == 0 {
+                } else if (h_mod ^ (dy as u64).wrapping_mul(17)) % 19 == 0 {
                     pal.crying_obsidian
-                } else if (h_mod ^ (dy as u64 * 11)) % 7 == 0 {
+                } else if (h_mod ^ (dy as u64).wrapping_mul(11)) % 7 == 0 {
                     bsc
                 } else if dy % 4 == 0 {
                     bsbp

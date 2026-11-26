@@ -671,7 +671,7 @@ pub fn run_headless_playthrough(
     let dt = 0.05f32;
     let mut final_rep: Option<PlaythroughReport> = None;
 
-    for _ in 0..11500 {
+    for _ in 0..18000 {
         if !player.dimension.is_nether() {
             let pcx = (player.pos.x / 16.0).floor() as i32;
             let pcz = (player.pos.z / 16.0).floor() as i32;

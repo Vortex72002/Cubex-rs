@@ -384,15 +384,23 @@ impl SurvivalNetherBot {
             return out;
         }
 
-        if self.elapsed_secs > 480.0 {
+        if self.elapsed_secs > 720.0 {
             let stage_num = self.phase.stage_num();
             let rep = self.build_report(
                 false,
                 player,
                 current_fps,
                 Some(format!(
-                    "AutoBot timed out in Stage {stage_num}/5 ({})",
-                    self.detail
+                    "AutoBot timed out in Stage {stage_num}/5 ({}) at pos=({:.2},{:.2},{:.2}) target={:?} unstuck={:?} bl={} og={} liq={}",
+                    self.detail,
+                    player.pos.x,
+                    player.pos.y,
+                    player.pos.z,
+                    self.current_target,
+                    self.unstuck_dig_target,
+                    self.blacklisted.len(),
+                    player.on_ground,
+                    player.in_liquid,
                 )),
             );
             self.phase = BotPhase::Done;
@@ -1018,15 +1026,23 @@ impl SurvivalNetherBot {
 
         // If we already have gravel in inventory, cycle placing & re-mining it at a clean spot until flint drops
         if gravel_inv >= 1 {
+            if self.gravel_place_pos.is_some() && self.target_timer > 12.0 {
+                if let Some(old) = self.gravel_place_pos.take() {
+                    self.blacklisted.insert(old);
+                }
+                self.target_timer = 0.0;
+            }
             if self.gravel_place_pos.is_none() {
                 self.gravel_place_pos =
                     find_nearby_placement_spot(world, reg, player.pos, &self.blacklisted);
+                self.target_timer = 0.0;
             }
             if let Some(gpos) = self.gravel_place_pos {
                 let nid = world.get_node(gpos).0;
                 if reg.get_name_from_content_id(nid) == "mcl_core:gravel" {
                     if self.mine_block_or_approach(dt, player, player_state, world, reg, gpos, false, out) {
                         self.pickup_wait = 0.45;
+                        self.target_timer = 0.0;
                     }
                 } else {
                     let _ = self.place_item_at(
@@ -1041,6 +1057,9 @@ impl SurvivalNetherBot {
                         IVec3::Y,
                         out,
                     );
+                    if out.place_just {
+                        self.target_timer = 0.0;
+                    }
                 }
                 return;
             }
@@ -1419,7 +1438,9 @@ impl SurvivalNetherBot {
         self.detail = "Finding water source".into();
 
         if self.current_target.is_none_or(|p| {
-            !is_water_node(world.get_node(p).0, reg) || self.target_timer > 14.0
+            !is_water_node(world.get_node(p).0, reg)
+                || (self.target_timer > 14.0
+                    && (player.pos.distance(p.as_vec3() + 0.5) < 5.5 || self.target_timer > 36.0))
         }) {
             if let Some(old) = self.current_target.take() {
                 if self.target_timer > 14.0 {
@@ -1604,16 +1625,32 @@ impl SurvivalNetherBot {
         }
 
         // 3. Ensure solid floor at `origin.y - 1` under the frame and front casting walkway (and solid reservoir bottom)
-        let mut patch_target: Option<(IVec3, IVec3)> = None;
-        let res_bottom = res - IVec3::Y;
-        if !is_solid_walkable(world.get_node(res_bottom).0, reg) {
-            let mut cur = res_bottom;
+        let find_fill_support = |target: IVec3| -> (IVec3, IVec3, IVec3) {
+            let below = target - IVec3::Y;
+            if is_solid_walkable(world.get_node(below).0, reg) {
+                return (target, below, IVec3::Y);
+            }
+            for dir in [IVec3::X, -IVec3::X, IVec3::Z, -IVec3::Z] {
+                let nbr = target + dir;
+                if is_solid_walkable(world.get_node(nbr).0, reg) {
+                    return (target, nbr, -dir);
+                }
+            }
+            let mut cur = target;
             while cur.y > 40 && !is_solid_walkable(world.get_node(cur - IVec3::Y).0, reg) {
                 cur -= IVec3::Y;
             }
-            patch_target = Some((cur, cur - IVec3::Y));
+            (cur, cur - IVec3::Y, IVec3::Y)
+        };
+
+        let mut patch_target: Option<(IVec3, IVec3, IVec3)> = None;
+        let res_bottom = res - IVec3::Y;
+        if !is_solid_walkable(world.get_node(res_bottom).0, reg) {
+            patch_target = Some(find_fill_support(res_bottom));
         }
         if patch_target.is_none() {
+            // Prefer gaps touching existing solid neighbors first so deep pits bridge cleanly horizontally
+            let mut fallback_gap: Option<IVec3> = None;
             'floor_scan: for z in (origin.z - 3)..=origin.z {
                 for x in (origin.x - 3)..=(origin.x + 2) {
                     let fp = IVec3::new(x, origin.y - 1, z);
@@ -1622,17 +1659,24 @@ impl SurvivalNetherBot {
                     }
                     let id = world.get_node(fp).0;
                     if id == CONTENT_AIR || is_liquid_node_id(id, reg) {
-                        let mut cur = fp;
-                        while cur.y > 40 && !is_solid_walkable(world.get_node(cur - IVec3::Y).0, reg) {
-                            cur -= IVec3::Y;
+                        let candidate = find_fill_support(fp);
+                        if candidate.0 == fp {
+                            patch_target = Some(candidate);
+                            break 'floor_scan;
                         }
-                        patch_target = Some((cur, cur - IVec3::Y));
-                        break 'floor_scan;
+                        if fallback_gap.is_none() {
+                            fallback_gap = Some(fp);
+                        }
                     }
                 }
             }
+            if patch_target.is_none() {
+                if let Some(fp) = fallback_gap {
+                    patch_target = Some(find_fill_support(fp));
+                }
+            }
         }
-        if let Some((pp, sup)) = patch_target {
+        if let Some((pp, sup, normal)) = patch_target {
             if let Some(fill) = find_placeable_filler_block(player_state) {
                 self.detail = "Leveling portal floor".into();
                 let _ = self.place_item_at(
@@ -1644,7 +1688,7 @@ impl SurvivalNetherBot {
                     &fill,
                     pp,
                     sup,
-                    IVec3::Y,
+                    normal,
                     out,
                 );
                 return;
@@ -2640,7 +2684,7 @@ impl SurvivalNetherBot {
             1.15
         };
         let max_horiz = if place_pos.y < player.pos.y.floor() as i32 && face_normal == IVec3::Y {
-            1.65
+            1.12
         } else {
             3.5
         };
@@ -2658,7 +2702,7 @@ impl SurvivalNetherBot {
                 .normalize_or_zero()
             };
             let push_dist = if max_horiz < 2.0 {
-                1.25
+                0.92
             } else if min_horiz < 1.0 {
                 1.15
             } else {
@@ -2689,7 +2733,9 @@ impl SurvivalNetherBot {
         let aim_pt = support_pos.as_vec3() + Vec3::splat(0.5) + face_normal.as_vec3() * 0.45;
         if smooth_aim_at(player, aim_pt, dt) {
             if let Some(hit) = raycast_voxel_ex(player.eye_pos(), player.look_dir(), 5.0, false, world, reg) {
-                let target_hit = hit.under == support_pos && hit.above == place_pos;
+                let hit_buildable = reg.get_node_def(hit.node_id).is_some_and(|d| d.buildable_to);
+                let target_hit = (hit.under == support_pos && hit.above == place_pos)
+                    || (hit.under == place_pos && hit_buildable);
                 if target_hit && self.place_cooldown <= 0.0 {
                     out.place_just = true;
                     self.place_cooldown = 0.25;
@@ -2866,11 +2912,7 @@ impl SurvivalNetherBot {
         let dir_x = dx / horiz_dist;
         let dir_z = dz / horiz_dist;
 
-        smooth_aim_at(
-            player,
-            Vec3::new(target.x, player.eye_pos().y - 0.15, target.z),
-            dt,
-        );
+        let aim_target = Vec3::new(target.x, player.eye_pos().y - 0.15, target.z);
 
         let feet_y = player.pos.y.floor() as i32;
         let cur_x = player.pos.x.floor() as i32;
@@ -2880,6 +2922,7 @@ impl SurvivalNetherBot {
 
         // Avoid stepping onto lava
         if avoid_lava && has_lava_in_column(world, reg, ahead_x, feet_y - 2..=feet_y + 1, ahead_z) {
+            smooth_aim_at(player, aim_target, dt);
             out.move_input.right = true;
             out.move_input.jump = true;
             return;
@@ -2934,19 +2977,46 @@ impl SurvivalNetherBot {
             out.move_input.jump = true;
         }
 
-        let break_pos = if let Some(hp) = head_bp {
-            Some(hp)
-        } else if self.no_move_timer > 1.0 {
-            if let Some(p) = self.unstuck_dig_target.filter(|&p| {
-                !self.is_active_scaffold_protected(p)
-                    && is_solid_walkable(world.get_node(p).0, reg)
-            }) {
+        let head_ceil = world.get_node(IVec3::new(cur_x, feet_y + 2, cur_z)).0;
+        let overhead_blocked = is_solid_walkable(head_ceil, reg)
+            && !is_protected_node(head_ceil, reg)
+            && !self.is_active_scaffold_protected(IVec3::new(cur_x, feet_y + 2, cur_z));
+
+        let in_strafe_escape = self.no_move_timer > 6.5 && (self.no_move_timer % 8.5) > 6.5;
+        if in_strafe_escape {
+            self.unstuck_dig_target = None;
+        }
+
+        let valid_unstuck = self.unstuck_dig_target.filter(|&p| {
+            p.y >= feet_y
+                && p.y <= feet_y + 2
+                && !self.is_active_scaffold_protected(p)
+                && is_solid_walkable(world.get_node(p).0, reg)
+                && player.eye_pos().distance(p.as_vec3() + 0.5) <= 2.6
+        });
+
+        let break_pos = if in_strafe_escape {
+            None
+        } else if let Some(hp) = head_bp {
+            if !player.on_ground {
+                valid_unstuck.or(Some(hp))
+            } else {
+                Some(hp)
+            }
+        } else if self.no_move_timer > 1.2 {
+            if let Some(p) = valid_unstuck {
                 Some(p)
             } else {
-                let cand = foot_bp.or(top_bp);
+                let cand = if overhead_blocked {
+                    Some(IVec3::new(cur_x, feet_y + 2, cur_z)).or(top_bp).or(foot_bp)
+                } else {
+                    foot_bp.or(top_bp)
+                };
                 self.unstuck_dig_target = cand;
                 cand
             }
+        } else if !player.on_ground {
+            valid_unstuck.filter(|&p| p.y >= feet_y + 1)
         } else {
             None
         };
@@ -2954,26 +3024,31 @@ impl SurvivalNetherBot {
         if let Some(bp) = break_pos {
             let b_id = world.get_node(bp).0;
             if b_id != CONTENT_AIR && b_id != CONTENT_IGNORE {
+                self.unstuck_dig_target = Some(bp);
                 equip_best_tool_for_block(player, player_state, reg.get_name_from_content_id(b_id));
-                smooth_aim_at(player, bp.as_vec3() + 0.5, dt);
+                out.move_input.jump = false;
+                let aimed = smooth_aim_at(player, bp.as_vec3() + 0.5, dt);
+                if !aimed {
+                    return;
+                }
                 if let Some(hit) = raycast_voxel_ex(player.eye_pos(), player.look_dir(), 4.5, false, world, reg) {
                     if !is_protected_node(hit.node_id, reg) && !self.is_active_scaffold_protected(hit.under) {
                         out.mine_held = true;
-                        if self.no_move_timer > 1.8 {
-                            out.move_input.jump = true;
-                        }
                         return;
                     }
                 }
             }
         } else if self.no_move_timer > 3.5 {
+            smooth_aim_at(player, aim_target, dt);
             let side = ((self.no_move_timer / 2.0) as usize + self.explore_idx) % 2;
             out.move_input.right = side == 0;
             out.move_input.left = side == 1;
+            out.move_input.forward = in_strafe_escape;
             out.move_input.jump = true;
             return;
         }
 
+        smooth_aim_at(player, aim_target, dt);
         out.move_input.forward = true;
         out.move_input.sprint = horiz_dist > 4.5 && player.hunger > 8 && !player.in_liquid;
         if self.no_move_timer > 1.0 && !player.in_liquid {
@@ -4930,7 +5005,36 @@ mod tests {
             }
         }
 
-        let rep = final_rep.expect("AutoBot must complete or emit report within tick budget");
+        let rep = final_rep.unwrap_or_else(|| {
+            let hud = bot.hud_status();
+            let px = player.pos.x.floor() as i32;
+            let py = player.pos.y.floor() as i32;
+            let pz = player.pos.z.floor() as i32;
+            let mut nearby = Vec::new();
+            for dy in 0..=2 {
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        let p = IVec3::new(px + dx, py + dy, pz + dz);
+                        let id = ow.get_node(p).0;
+                        if id != CONTENT_AIR {
+                            nearby.push((p, reg.get_name_from_content_id(id)));
+                        }
+                    }
+                }
+            }
+            panic!(
+                "AutoBot timed out: stage={}/5 detail={} pos={:?} look={:?} on_ground={} in_liq={} target={:?} unstuck={:?} nearby={:?}",
+                hud.stage_num,
+                hud.detail,
+                player.pos,
+                player.look_dir(),
+                player.on_ground,
+                player.in_liquid,
+                bot.current_target,
+                bot.unstuck_dig_target,
+                nearby,
+            );
+        });
         assert!(
             rep.passed,
             "AutoBot failed at stage {} ({}): {:?}",

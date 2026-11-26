@@ -372,6 +372,8 @@ pub fn run_visual_regression(
             main[0] = ItemStackData::from_spec(&format!("{RAM_MIC_ITEM_ID} 1"));
         }
     }
+    player.yaw = 0.55;
+    player.pitch = -0.10;
     renderer.update_player_model_with_swing(
         player.pos,
         player.yaw,
@@ -390,13 +392,15 @@ pub fn run_visual_regression(
     renderer.show_player_model = true;
     renderer.show_viewmodel = false;
     let rig_3p = compute_camera_rig(
-        CameraMode::ThirdPersonBack,
+        CameraMode::ThirdPersonFront,
         &player,
         w as f32 / h as f32,
         &qa_settings,
         &ow,
         reg,
     );
+    player.yaw = 0.25;
+    player.pitch = -0.14;
     let cam_02 = ViewportCamera {
         cam_pos: rig_3p.eye_pos,
         view_proj: rig_3p.view_proj,
@@ -429,7 +433,9 @@ pub fn run_visual_regression(
     renderer.show_player_model = false;
     let mut creative_state = CreativeInventoryState::default();
     let mut inv_cursor = InventoryCursor::default();
-    let cat_out = egui_ctx.run(make_raw_input(0.4), |ctx| {
+    // Run one layout warm-up frame so egui's Area sizing pass settles before capture,
+    // and preserve any font/icon texture deltas uploaded during pass 1.
+    let warmup = egui_ctx.run(make_raw_input(0.36), |ctx| {
         let screen = ctx.screen_rect();
         let _ = render_creative_inventory(
             ctx,
@@ -446,6 +452,45 @@ pub fn run_visual_regression(
             None,
         );
     });
+    let mut cat_out = egui_ctx.run(make_raw_input(0.40), |ctx| {
+        let screen = ctx.screen_rect();
+        let _ = render_creative_inventory(
+            ctx,
+            &theme,
+            &mut creative_state,
+            &ps,
+            0,
+            reg,
+            atlas,
+            &mut icon_cache,
+            &mut inv_cursor,
+            screen,
+            7,
+            None,
+        );
+    });
+    let mut merged_set = warmup.textures_delta.set;
+    merged_set.extend(cat_out.textures_delta.set);
+    cat_out.textures_delta.set = merged_set;
+    let mut merged_free = warmup.textures_delta.free;
+    merged_free.extend(cat_out.textures_delta.free);
+    cat_out.textures_delta.free = merged_free;
+
+    fn shape_contains_text(shape: &egui::epaint::Shape, needle: &str) -> bool {
+        match shape {
+            egui::epaint::Shape::Text(t) => t.galley.text().contains(needle),
+            egui::epaint::Shape::Vec(v) => v.iter().any(|s| shape_contains_text(s, needle)),
+            _ => false,
+        }
+    }
+    let has_creative_title = cat_out
+        .shapes
+        .iter()
+        .any(|s| shape_contains_text(&s.shape, "Creative Catalog"));
+    anyhow::ensure!(
+        has_creative_title,
+        "Creative Catalog UI did not emit visible 'Creative Catalog' header shapes"
+    );
     let cam_03 = ViewportCamera {
         cam_pos: rig_1p.eye_pos,
         view_proj: rig_1p.view_proj,

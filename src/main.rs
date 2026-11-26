@@ -9659,6 +9659,9 @@ fn run_qa_suite(
         static_audit.total_recipes,
         static_audit.failures.len()
     );
+    for f in &static_audit.failures {
+        println!("[QA SUITE]   Phase 1 failure: {f}");
+    }
 
     println!("[QA SUITE] Phase 2: Physics & edge-case chaos fuzzer ({fuzz_seeds} seeds)...");
     let fuzzer = run_physics_fuzzer(fuzz_seeds, &reg);
@@ -9683,6 +9686,9 @@ fn run_qa_suite(
         playthrough.chest_looted_items,
         playthrough.ocean_monument_verified
     );
+    if let Some(ref reason) = playthrough.failure_reason {
+        println!("[QA SUITE]   Phase 3 failure: {reason}");
+    }
 
     println!("[QA SUITE] Phase 4: Offscreen wgpu visual regression & perf telemetry...");
     let visual = run_visual_regression(

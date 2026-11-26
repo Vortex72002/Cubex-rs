@@ -521,6 +521,7 @@ pub fn render_creative_inventory(
 
     // Backdrop strictly inside player's viewport
     egui::Area::new(egui::Id::new(("cubex_creative_backdrop", id_salt)))
+        .fade_in(false)
         .fixed_pos(viewport.min)
         .show(ctx, |ui| {
             ui.painter()
@@ -539,6 +540,7 @@ pub fn render_creative_inventory(
     let mut hover_tooltip: Option<String> = None;
 
     egui::Area::new(egui::Id::new(("cubex_creative_window", id_salt)))
+        .fade_in(false)
         .fixed_pos(win_rect.min)
         .show(ctx, |ui| {
             ui.set_clip_rect(viewport);
